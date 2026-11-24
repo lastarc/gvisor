@@ -697,10 +697,10 @@ func (e *endpoint) writePacketPostRouting(r *stack.Route, pkt *stack.PacketBuffe
 
 	if packetMustBeFragmented(pkt, networkMTU) {
 		h := header.IPv4(pkt.NetworkHeader().Slice())
-		if h.TransportProtocol() == header.TCPProtocolNumber && ip.CanSegmentTCP(pkt, networkMTU) {
+		if h.TransportProtocol() == header.TCPProtocolNumber && ip.CanSegmentTCP(pkt, len(h), networkMTU) {
 			// A forwarded TCP packet coalesced from segments that fit the link:
 			// resegment it, as a NIC with TCP segmentation offload would.
-			sent, remain, err := ip.SegmentTCP(pkt, int(r.MaxHeaderLength()), func(seg *stack.PacketBuffer, i int, tcpLen uint16) uint16 {
+			sent, remain, err := ip.SegmentTCP(pkt, h, int(r.MaxHeaderLength()), func(seg *stack.PacketBuffer, i int, tcpLen uint16) uint16 {
 				segHdr := header.IPv4(seg.NetworkHeader().Slice())
 				segHdr.SetTotalLength(uint16(len(segHdr)) + tcpLen)
 				segHdr.SetID(segHdr.ID() + uint16(i))
@@ -840,7 +840,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	// netstack or in the host). Record the segment size so that the packet can
 	// be resegmented if it does not fit the outgoing link.
 	if h.TransportProtocol() == header.TCPProtocolNumber && h.FragmentOffset() == 0 && h.Flags()&header.IPv4FlagMoreFragments == 0 {
-		newPkt.GROSegmentSize = ip.ForwardedTCPSegmentSize(pkt, e.nic.MTU(), forwardToEp.nic.MTU())
+		newPkt.GROSegmentSize = ip.ForwardedTCPSegmentSize(pkt, len(h), int(h.TotalLength()), e.nic.MTU(), forwardToEp.nic.MTU())
 	}
 
 	if updateOptions {

@@ -1027,11 +1027,11 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer, protocol
 
 	if packetMustBeFragmented(pkt, networkMTU) {
 		if pkt.NetworkPacketInfo.IsForwardedPacket {
-			if header.IPv6(pkt.NetworkHeader().Slice()).TransportProtocol() == header.TCPProtocolNumber && ip.CanSegmentTCP(pkt, networkMTU) {
+			if h := header.IPv6(pkt.NetworkHeader().Slice()); h.TransportProtocol() == header.TCPProtocolNumber && ip.CanSegmentTCP(pkt, len(h), networkMTU) {
 				// A forwarded TCP packet coalesced from segments that fit the
 				// link: resegment it, as a NIC with TCP segmentation offload
 				// would.
-				sent, remain, err := ip.SegmentTCP(pkt, int(r.MaxHeaderLength()), func(seg *stack.PacketBuffer, _ int, tcpLen uint16) uint16 {
+				sent, remain, err := ip.SegmentTCP(pkt, h, int(r.MaxHeaderLength()), func(seg *stack.PacketBuffer, _ int, tcpLen uint16) uint16 {
 					segHdr := header.IPv6(seg.NetworkHeader().Slice())
 					segHdr.SetPayloadLength(tcpLen)
 					return header.PseudoHeaderChecksum(header.TCPProtocolNumber, segHdr.SourceAddress(), segHdr.DestinationAddress(), tcpLen)
@@ -1258,7 +1258,7 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	// netstack or in the host). Record the segment size so that the packet can
 	// be resegmented if it does not fit the outgoing link.
 	if h.TransportProtocol() == header.TCPProtocolNumber {
-		newPkt.GROSegmentSize = ip.ForwardedTCPSegmentSize(pkt, e.nic.MTU(), forwardToEp.nic.MTU())
+		newPkt.GROSegmentSize = ip.ForwardedTCPSegmentSize(pkt, len(h), len(h)+int(h.PayloadLength()), e.nic.MTU(), forwardToEp.nic.MTU())
 	}
 
 	switch err := forwardToEp.writePacket(route, newPkt, newPkt.TransportProtocolNumber, true /* headerIncluded */); err.(type) {

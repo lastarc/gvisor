@@ -24,12 +24,17 @@ import (
 )
 
 // forwardedTCPHeader returns a copy of the TCP header of pkt, an IP packet
-// whose network header is populated and whose transport protocol is TCP, and
-// the number of TCP payload bytes that follow it.
-func forwardedTCPHeader(pkt *stack.PacketBuffer) (header.TCP, int, bool) {
+// whose network header of netHdrLen bytes is populated and whose transport
+// protocol is TCP, and the number of TCP payload bytes that follow it.
+//
+// It only reads from a clone of pkt's buffer. In particular, it must not pull
+// up pkt's own headers while the clone exists: a pull-up of a shared chunk
+// moves pkt onto a private copy, and the original chunk would then be released
+// along with the clone, invalidating any header slice the caller still holds.
+func forwardedTCPHeader(pkt *stack.PacketBuffer, netHdrLen int) (header.TCP, int, bool) {
 	buf := stack.BufferSince(pkt.NetworkHeader())
 	defer buf.Release()
-	buf.TrimFront(int64(len(pkt.NetworkHeader().Slice())))
+	buf.TrimFront(int64(netHdrLen))
 	v, ok := buf.PullUp(0, header.TCPMinimumSize)
 	if !ok {
 		return nil, 0, false
@@ -78,15 +83,16 @@ func forwardedTCPHeader(pkt *stack.PacketBuffer) (header.TCP, int, bool) {
 //
 // A packet with no recorded segment size that fits the ingress link may be a
 // single segment, and is treated like any other packet.
-func ForwardedTCPSegmentSize(pkt *stack.PacketBuffer, ingressMTU, egressMTU uint32) uint16 {
-	netHdrLen := len(pkt.NetworkHeader().Slice())
-	totalLen := netHdrLen + len(pkt.TransportHeader().Slice()) + pkt.Data().Size()
+//
+// netHdrLen and totalLen are the lengths of pkt's network header and of the
+// whole IP packet, which the caller has already parsed.
+func ForwardedTCPSegmentSize(pkt *stack.PacketBuffer, netHdrLen, totalLen int, ingressMTU, egressMTU uint32) uint16 {
 	if uint32(totalLen) <= egressMTU || (pkt.GROSegmentSize == 0 && uint32(totalLen) <= ingressMTU) {
 		// The packet fits the egress link, the common case, or may be a single
 		// segment. Avoid parsing the TCP header.
 		return 0
 	}
-	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt)
+	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt, netHdrLen)
 	if !ok {
 		return 0
 	}
@@ -111,16 +117,16 @@ func ForwardedTCPSegmentSize(pkt *stack.PacketBuffer, ingressMTU, egressMTU uint
 // net.ipv4.tcp_min_snd_mss.
 const minSegmentSize = 48
 
-// CanSegmentTCP returns whether pkt, a forwarded IP packet carrying a TCP
-// segment whose payload exceeds networkMTU (the MTU available to the network
-// layer payload), can be sent by SegmentTCP in segments that each fit
-// networkMTU.
-func CanSegmentTCP(pkt *stack.PacketBuffer, networkMTU uint32) bool {
+// CanSegmentTCP returns whether pkt, a forwarded IP packet with a network
+// header of netHdrLen bytes carrying a TCP segment whose payload exceeds
+// networkMTU (the MTU available to the network layer payload), can be sent by
+// SegmentTCP in segments that each fit networkMTU.
+func CanSegmentTCP(pkt *stack.PacketBuffer, netHdrLen int, networkMTU uint32) bool {
 	mss := int(pkt.GROSegmentSize)
 	if mss == 0 || !pkt.NetworkPacketInfo.IsForwardedPacket {
 		return false
 	}
-	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt)
+	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt, netHdrLen)
 	if !ok || payloadLen <= mss {
 		return false
 	}
@@ -175,13 +181,16 @@ const (
 // and for IPv4 its identification and checksum; it returns the TCP
 // pseudo-header checksum for the segment, whose TCP length is given.
 //
-// reserve is the number of bytes to reserve for link-layer headers.
+// netHdr is pkt's network header, which is copied before pkt's buffer is
+// touched. reserve is the number of bytes to reserve for link-layer headers.
 //
 // It returns the number of segments written, the number that were not, and
 // the error that stopped it, if any.
-func SegmentTCP(pkt *stack.PacketBuffer, reserve int, fixNetworkHeader func(seg *stack.PacketBuffer, index int, tcpLen uint16) uint16, write func(*stack.PacketBuffer) tcpip.Error) (int, int, tcpip.Error) {
-	netHdr := pkt.NetworkHeader().Slice()
-	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt)
+func SegmentTCP(pkt *stack.PacketBuffer, netHdr []byte, reserve int, fixNetworkHeader func(seg *stack.PacketBuffer, index int, tcpLen uint16) uint16, write func(*stack.PacketBuffer) tcpip.Error) (int, int, tcpip.Error) {
+	// Segments share pkt's payload chunks, and the caller's slice must not be
+	// relied upon once those are cloned: work from a private copy.
+	netHdr = append([]byte(nil), netHdr...)
+	tcpHdr, payloadLen, ok := forwardedTCPHeader(pkt, len(netHdr))
 	if !ok {
 		return 0, 1, &tcpip.ErrMalformedHeader{}
 	}

@@ -35,6 +35,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	iptestutil "gvisor.dev/gvisor/pkg/tcpip/network/internal/testutil"
@@ -5069,5 +5070,141 @@ func TestForwardingCoalescedTCP(t *testing.T) {
 				t.Errorf("got Forwarding.PacketTooBig = %d, want 0", got)
 			}
 		})
+	}
+}
+
+// scribblingEndpoint is a link endpoint that, like a busy receive path, takes
+// pooled buffer chunks of every size class and overwrites them whenever it
+// writes packets. Any use of buffer memory that was released back to the pool
+// then corrupts what is written next.
+type scribblingEndpoint struct {
+	*channel.Endpoint
+}
+
+// WritePackets implements stack.LinkEndpoint.WritePackets.
+func (e *scribblingEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	for size := 64; size <= buffer.MaxChunkSize; size *= 2 {
+		var views []*buffer.View
+		for i := 0; i < 4; i++ {
+			v := buffer.NewViewSize(size)
+			b := v.AsSlice()
+			for j := range b {
+				b[j] = 0xee
+			}
+			views = append(views, v)
+		}
+		for _, v := range views {
+			v.Release()
+		}
+	}
+	return e.Endpoint.WritePackets(pkts)
+}
+
+// TestForwardingCoalescedTCPEthernet forwards a coalesced TCP packet received
+// on an Ethernet NIC, like a fdbased one, out of an Ethernet NIC with a smaller
+// MTU, while the buffer pool is being reused. All segments must carry intact
+// headers.
+func TestForwardingCoalescedTCPEthernet(t *testing.T) {
+	const (
+		incomingMTU    = 1500
+		outgoingMTU    = 1400
+		groSegmentSize = 1000
+		incomingLink   = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x06")
+		remoteLink1    = tcpip.LinkAddress("\xee\xee\xee\xee\xee\xee")
+		outgoingLink   = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x07")
+		remoteLink2    = tcpip.LinkAddress("\xee\xee\xee\xee\xee\xef")
+	)
+	ctx := newTestContext()
+	defer ctx.cleanup()
+	s := ctx.s
+
+	incoming := channel.New(4, incomingMTU, incomingLink)
+	defer incoming.Close()
+	outgoing := &scribblingEndpoint{channel.New(64, outgoingMTU, outgoingLink)}
+	defer outgoing.Close()
+	for nicID, ep := range map[tcpip.NICID]stack.LinkEndpoint{
+		incomingNICID: ethernet.New(incoming),
+		outgoingNICID: ethernet.New(outgoing),
+	} {
+		if err := s.CreateNIC(nicID, ep); err != nil {
+			t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+		}
+		protoAddr := tcpip.ProtocolAddress{Protocol: header.IPv4ProtocolNumber, AddressWithPrefix: defaultEndpointConfigs[nicID]}
+		if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
+			t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protoAddr, err)
+		}
+	}
+	s.SetRouteTable([]tcpip.Route{
+		{Destination: incomingIPv4Addr.Subnet(), NIC: incomingNICID},
+		{Destination: outgoingIPv4Addr.Subnet(), NIC: outgoingNICID},
+	})
+	if err := s.AddStaticNeighbor(outgoingNICID, header.IPv4ProtocolNumber, remoteIPv4Addr2, remoteLink2); err != nil {
+		t.Fatalf("s.AddStaticNeighbor(...): %s", err)
+	}
+	if err := s.SetForwardingDefaultAndAllNICs(header.IPv4ProtocolNumber, true); err != nil {
+		t.Fatalf("s.SetForwardingDefaultAndAllNICs(%d, true): %s", header.IPv4ProtocolNumber, err)
+	}
+
+	opts := make([]byte, 12)
+	header.EncodeTSOption(1, 2, opts)
+	// Full segments and a short last one, several times.
+	payload := make([]byte, 4*groSegmentSize+14)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	const packets = 3
+	for p := 0; p < packets; p++ {
+		ipPkt := newCoalescedPacket(remoteIPv4Addr1, remoteIPv4Addr2, header.TCPProtocolNumber, uint32(1000+p*len(payload)), header.TCPFlagAck, true /* df */, opts, payload, 0)
+		frame := make([]byte, header.EthernetMinimumSize)
+		header.Ethernet(frame).Encode(&header.EthernetFields{
+			SrcAddr: remoteLink1,
+			DstAddr: incomingLink,
+			Type:    header.IPv4ProtocolNumber,
+		})
+		v := stack.PayloadSince(ipPkt.NetworkHeader())
+		frame = append(frame, v.AsSlice()...)
+		v.Release()
+		ipPkt.DecRef()
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(frame)})
+		pkt.GROSegmentSize = groSegmentSize
+		incoming.InjectInbound(0, pkt)
+		pkt.DecRef()
+	}
+
+	if p := incoming.Read(); p != nil {
+		p.DecRef()
+		t.Error("got unexpected packet (ICMP error?) on incoming NIC")
+	}
+	seq := uint32(1000)
+	for i := 0; i < packets*5; i++ {
+		p := outgoing.Read()
+		if p == nil {
+			t.Fatalf("got %d forwarded segments, want %d", i, packets*5)
+		}
+		v := stack.PayloadSince(p.NetworkHeader())
+		ipH := header.IPv4(v.AsSlice())
+		if !ipH.IsValid(len(ipH)) || !ipH.IsChecksumValid() {
+			t.Fatalf("segment %d: invalid IPv4 header %x", i, v.AsSlice()[:min(len(ipH), header.IPv4MinimumSize)])
+		}
+		if ipH.SourceAddress() != remoteIPv4Addr1 || ipH.DestinationAddress() != remoteIPv4Addr2 || ipH.TTL() != 63 {
+			t.Errorf("segment %d: got src %s dst %s TTL %d, want %s, %s, 63", i, ipH.SourceAddress(), ipH.DestinationAddress(), ipH.TTL(), remoteIPv4Addr1, remoteIPv4Addr2)
+		}
+		tcpH := header.TCP(ipH.Payload())
+		wantLen := groSegmentSize
+		if i%5 == 4 {
+			wantLen = 14
+		}
+		if got := len(tcpH.Payload()); got != wantLen {
+			t.Errorf("segment %d: got payload length %d, want %d", i, got, wantLen)
+		}
+		if got := tcpH.SequenceNumber(); got != seq {
+			t.Errorf("segment %d: got seq = %d, want = %d", i, got, seq)
+		}
+		if !tcpH.IsChecksumValid(ipH.SourceAddress(), ipH.DestinationAddress(), checksum.Checksum(tcpH.Payload(), 0), uint16(len(tcpH.Payload()))) {
+			t.Errorf("segment %d: invalid TCP checksum", i)
+		}
+		seq += uint32(len(tcpH.Payload()))
+		v.Release()
+		p.DecRef()
 	}
 }
