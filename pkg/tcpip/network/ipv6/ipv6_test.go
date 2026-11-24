@@ -4691,3 +4691,200 @@ func TestRecalculateChecksum(t *testing.T) {
 		})
 	}
 }
+
+// TestForwardingCoalescedTCP tests that TCP packets larger than the outgoing
+// link MTU, which were coalesced by GRO or by the host's TSO/GSO, are
+// resegmented rather than rejected.
+func TestForwardingCoalescedTCP(t *testing.T) {
+	const (
+		incomingMTU = 1500
+		outgoingMTU = 1400
+		tcpHdrLen   = header.TCPMinimumSize + 12
+	)
+	tests := []struct {
+		name           string
+		payloadLen     int
+		groSegmentSize uint16
+		wantSegments   []int
+		// wantICMP is whether the packet is expected to be dropped with an
+		// ICMP packet too big error carrying the outgoing MTU.
+		wantICMP bool
+	}{
+		{
+			name:           "known segment size fits",
+			payloadLen:     2500,
+			groSegmentSize: 1000,
+			wantSegments:   []int{1000, 1000, 500},
+		},
+		{
+			name:           "known segment size too large for outgoing link",
+			payloadLen:     2 * 1428,
+			groSegmentSize: 1428,
+			wantICMP:       true,
+		},
+		{
+			name:         "unknown segment size larger than incoming MTU",
+			payloadLen:   4000,
+			wantSegments: []int{1000, 1000, 1000, 1000},
+		},
+		{
+			// Netstack GRO merging two host super-frames records the first
+			// one's payload size, which no packet on the incoming link could
+			// have had. It must be treated as unknown, not rejected.
+			name:           "recorded segment size larger than incoming link",
+			payloadLen:     2 * 2856,
+			groSegmentSize: 2856,
+			wantSegments:   []int{1143, 1143, 1143, 1143, 1140},
+		},
+		{
+			name:           "implausibly small recorded segment size within incoming MTU",
+			payloadLen:     incomingMTU - header.IPv6MinimumSize - tcpHdrLen,
+			groSegmentSize: 14,
+			wantSegments:   []int{714, 714},
+		},
+		{
+			// Possibly a single segment sent before the sender learned the
+			// path MTU: standard behaviour.
+			name:       "unknown segment size within incoming MTU",
+			payloadLen: incomingMTU - header.IPv6MinimumSize - tcpHdrLen,
+			wantICMP:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := newTestContext()
+			defer ctx.cleanup()
+			s := ctx.s
+
+			endpoints := make(map[tcpip.NICID]*channel.Endpoint)
+			for nicID, addr := range defaultEndpointConfigs {
+				mtu := uint32(incomingMTU)
+				if nicID == outgoingNICID {
+					mtu = outgoingMTU
+				}
+				ep := channel.New(16, mtu, "")
+				defer ep.Close()
+				if err := s.CreateNIC(nicID, ep); err != nil {
+					t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+				}
+				protoAddr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: addr}
+				if err := s.AddProtocolAddress(nicID, protoAddr, stack.AddressProperties{}); err != nil {
+					t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protoAddr, err)
+				}
+				endpoints[nicID] = ep
+			}
+			s.SetRouteTable([]tcpip.Route{
+				{Destination: incomingIPv6Addr.Subnet(), NIC: incomingNICID},
+				{Destination: outgoingIPv6Addr.Subnet(), NIC: outgoingNICID},
+			})
+			if err := s.SetForwardingDefaultAndAllNICs(ProtocolNumber, true); err != nil {
+				t.Fatalf("s.SetForwardingDefaultAndAllNICs(%d, true): %s", ProtocolNumber, err)
+			}
+
+			payload := make([]byte, test.payloadLen)
+			for i := range payload {
+				payload[i] = byte(i)
+			}
+			hdr := prependable.New(header.IPv6MinimumSize + tcpHdrLen + len(payload))
+			copy(hdr.Prepend(len(payload)), payload)
+			tcpH := header.TCP(hdr.Prepend(tcpHdrLen))
+			tcpH.Encode(&header.TCPFields{
+				SrcPort:    80,
+				DstPort:    1234,
+				SeqNum:     1000,
+				AckNum:     2000,
+				DataOffset: tcpHdrLen,
+				Flags:      header.TCPFlagAck | header.TCPFlagPsh | header.TCPFlagFin | header.TCPFlagCwr,
+				WindowSize: 65535,
+				Checksum:   0xdead,
+			})
+			header.EncodeTSOption(1, 2, tcpH[header.TCPMinimumSize:])
+			header.IPv6(hdr.Prepend(header.IPv6MinimumSize)).Encode(&header.IPv6Fields{
+				PayloadLength:     uint16(tcpHdrLen + len(payload)),
+				TransportProtocol: header.TCPProtocolNumber,
+				HopLimit:          64,
+				SrcAddr:           remoteIPv6Addr1,
+				DstAddr:           remoteIPv6Addr2,
+			})
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				Payload: buffer.MakeWithData(hdr.View()),
+			})
+			pkt.GROSegmentSize = test.groSegmentSize
+			endpoints[incomingNICID].InjectInbound(ProtocolNumber, pkt)
+			pkt.DecRef()
+
+			reply := endpoints[incomingNICID].Read()
+			switch {
+			case test.wantICMP && reply == nil:
+				t.Error("got no ICMP error")
+			case !test.wantICMP && reply != nil:
+				reply.DecRef()
+				t.Error("got unexpected packet (ICMP error?) on incoming NIC")
+			case test.wantICMP:
+				v := stack.PayloadSince(reply.NetworkHeader())
+				checker.IPv6(t, v,
+					checker.SrcAddr(incomingIPv6Addr.Address),
+					checker.DstAddr(remoteIPv6Addr1),
+					checker.ICMPv6(checker.ICMPv6Type(header.ICMPv6PacketTooBig)))
+				if got := header.ICMPv6(header.IPv6(v.AsSlice()).Payload()).MTU(); got != outgoingMTU {
+					t.Errorf("got ICMP MTU = %d, want = %d", got, outgoingMTU)
+				}
+				v.Release()
+				reply.DecRef()
+			}
+
+			var gotPayload []byte
+			seq := uint32(1000)
+			for i, wantLen := range test.wantSegments {
+				p := endpoints[outgoingNICID].Read()
+				if p == nil {
+					t.Fatalf("got %d forwarded segments, want %d", i, len(test.wantSegments))
+				}
+				v := stack.PayloadSince(p.NetworkHeader())
+				ipH := header.IPv6(v.AsSlice())
+				if len(ipH) > outgoingMTU {
+					t.Errorf("segment %d: got packet length %d > MTU %d", i, len(ipH), outgoingMTU)
+				}
+				if got, want := int(ipH.PayloadLength()), len(ipH)-header.IPv6MinimumSize; got != want {
+					t.Errorf("segment %d: got payload length field = %d, want = %d", i, got, want)
+				}
+				if got, want := ipH.HopLimit(), uint8(63); got != want {
+					t.Errorf("segment %d: got hop limit = %d, want = %d", i, got, want)
+				}
+				segTCP := header.TCP(ipH.Payload())
+				segPayload := segTCP.Payload()
+				if len(segPayload) != wantLen {
+					t.Errorf("segment %d: got payload length %d, want %d", i, len(segPayload), wantLen)
+				}
+				if got := segTCP.SequenceNumber(); got != seq {
+					t.Errorf("segment %d: got seq = %d, want = %d", i, got, seq)
+				}
+				wantFlags := header.TCPFlagAck
+				if i == 0 {
+					wantFlags |= header.TCPFlagCwr
+				}
+				if i == len(test.wantSegments)-1 {
+					wantFlags |= header.TCPFlagPsh | header.TCPFlagFin
+				}
+				if got := segTCP.Flags(); got != wantFlags {
+					t.Errorf("segment %d: got flags = %s, want = %s", i, got, wantFlags)
+				}
+				if !segTCP.IsChecksumValid(ipH.SourceAddress(), ipH.DestinationAddress(), checksum.Checksum(segPayload, 0), uint16(len(segPayload))) {
+					t.Errorf("segment %d: invalid TCP checksum", i)
+				}
+				seq += uint32(len(segPayload))
+				gotPayload = append(gotPayload, segPayload...)
+				v.Release()
+				p.DecRef()
+			}
+			if p := endpoints[outgoingNICID].Read(); p != nil {
+				p.DecRef()
+				t.Errorf("got more than %d forwarded segments", len(test.wantSegments))
+			}
+			if len(test.wantSegments) != 0 && !bytes.Equal(gotPayload, payload) {
+				t.Error("reassembled forwarded payload differs from original")
+			}
+		})
+	}
+}

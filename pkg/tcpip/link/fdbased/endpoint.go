@@ -152,6 +152,10 @@ type endpoint struct {
 	// gsoKind is the supported kind of GSO.
 	gsoKind stack.SupportedGSO
 
+	// vnetHdr is true if the FDs have PACKET_VNET_HDR enabled without host
+	// GSO (Options.VnetHdr). Use usesVnetHdr to check for the header.
+	vnetHdr bool
+
 	// maxSyscallHeaderBytes has the same meaning as
 	// Options.MaxSyscallHeaderBytes.
 	maxSyscallHeaderBytes uintptr
@@ -208,6 +212,13 @@ type Options struct {
 
 	// GVisorGSOEnabled indicates whether Gvisor GSO is enabled or not.
 	GVisorGSOEnabled bool
+
+	// VnetHdr indicates that the FDs are AF_PACKET sockets with
+	// PACKET_VNET_HDR enabled, even though host GSO is not used. Received
+	// packets then carry the size of the segments that the host coalesced
+	// them from, which is needed to forward them correctly. It is implied
+	// by host GSO (a non-zero GSOMaxSize without GVisorGSOEnabled).
+	VnetHdr bool
 
 	// PacketDispatchMode specifies the type of inbound dispatcher to be
 	// used for this endpoint.
@@ -325,6 +336,7 @@ func New(opts *Options) (stack.LinkEndpoint, error) {
 				}
 				e.gsoMaxSize = opts.GSOMaxSize
 			}
+			e.vnetHdr = opts.VnetHdr
 		}
 		if opts.ProcessorsPerChannel == 0 {
 			opts.ProcessorsPerChannel = max(1, gomaxprocs.Base()/len(opts.FDs))
@@ -666,35 +678,49 @@ func (e *endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
 	return ok
 }
 
+// usesVnetHdr returns whether packets read from and written to the FDs are
+// preceded by a virtio-net header: always with host GSO, and otherwise if
+// requested by Options.VnetHdr.
+func (e *endpoint) usesVnetHdr() bool {
+	return e.gsoKind == stack.HostGSOSupported || e.vnetHdr
+}
+
+// vnetHdrFor returns the virtio-net header to write before pkt, or nil if the
+// FDs don't use one. The header only requests segmentation and checksum
+// offload from the host when host GSO is in use.
+func (e *endpoint) vnetHdrFor(pkt *stack.PacketBuffer) []byte {
+	if !e.usesVnetHdr() {
+		return nil
+	}
+	vnetHdr := virtioNetHdr{}
+	if e.gsoKind == stack.HostGSOSupported && pkt.GSOOptions.Type != stack.GSONone {
+		vnetHdr.hdrLen = uint16(pkt.HeaderSize())
+		if pkt.GSOOptions.NeedsCsum {
+			vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
+			vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
+			vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
+		}
+		if uint16(pkt.Data().Size()) > pkt.GSOOptions.MSS {
+			switch pkt.GSOOptions.Type {
+			case stack.GSOTCPv4:
+				vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
+			case stack.GSOTCPv6:
+				vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV6
+			default:
+				panic(fmt.Sprintf("Unknown gso type: %v", pkt.GSOOptions.Type))
+			}
+			vnetHdr.gsoSize = pkt.GSOOptions.MSS
+		}
+	}
+	return vnetHdr.marshal()
+}
+
 // writePacket writes outbound packets to the file descriptor. If it is not
 // currently writable, the packet is dropped.
 func (e *endpoint) writePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	fdInfo := e.fds[pkt.Hash%uint32(len(e.fds))]
 	fd := fdInfo.fd
-	var vnetHdrBuf []byte
-	if e.gsoKind == stack.HostGSOSupported {
-		vnetHdr := virtioNetHdr{}
-		if pkt.GSOOptions.Type != stack.GSONone {
-			vnetHdr.hdrLen = uint16(pkt.HeaderSize())
-			if pkt.GSOOptions.NeedsCsum {
-				vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
-				vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
-				vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
-			}
-			if uint16(pkt.Data().Size()) > pkt.GSOOptions.MSS {
-				switch pkt.GSOOptions.Type {
-				case stack.GSOTCPv4:
-					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
-				case stack.GSOTCPv6:
-					vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV6
-				default:
-					panic(fmt.Sprintf("Unknown gso type: %v", pkt.GSOOptions.Type))
-				}
-				vnetHdr.gsoSize = pkt.GSOOptions.MSS
-			}
-		}
-		vnetHdrBuf = vnetHdr.marshal()
-	}
+	vnetHdrBuf := e.vnetHdrFor(pkt)
 
 	views := pkt.AsSlices()
 	numIovecs := len(views)
@@ -744,30 +770,7 @@ func (e *endpoint) sendBatch(batchFDInfo fdInfo, pkts []*stack.PacketBuffer) (in
 		batch := pkts[packets:]
 		syscallHeaderBytes := uintptr(0)
 		for _, pkt := range batch {
-			var vnetHdrBuf []byte
-			if e.gsoKind == stack.HostGSOSupported {
-				vnetHdr := virtioNetHdr{}
-				if pkt.GSOOptions.Type != stack.GSONone {
-					vnetHdr.hdrLen = uint16(pkt.HeaderSize())
-					if pkt.GSOOptions.NeedsCsum {
-						vnetHdr.flags = _VIRTIO_NET_HDR_F_NEEDS_CSUM
-						vnetHdr.csumStart = header.EthernetMinimumSize + pkt.GSOOptions.L3HdrLen
-						vnetHdr.csumOffset = pkt.GSOOptions.CsumOffset
-					}
-					if pkt.GSOOptions.Type != stack.GSONone && uint16(pkt.Data().Size()) > pkt.GSOOptions.MSS {
-						switch pkt.GSOOptions.Type {
-						case stack.GSOTCPv4:
-							vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV4
-						case stack.GSOTCPv6:
-							vnetHdr.gsoType = _VIRTIO_NET_HDR_GSO_TCPV6
-						default:
-							panic(fmt.Sprintf("Unknown gso type: %v", pkt.GSOOptions.Type))
-						}
-						vnetHdr.gsoSize = pkt.GSOOptions.MSS
-					}
-				}
-				vnetHdrBuf = vnetHdr.marshal()
-			}
+			vnetHdrBuf := e.vnetHdrFor(pkt)
 
 			views, offset := pkt.AsViewList()
 			var skipped int

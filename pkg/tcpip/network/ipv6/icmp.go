@@ -1048,9 +1048,12 @@ func (*icmpReasonHostUnreachable) respondsToMulticast() bool {
 	return false
 }
 
-// icmpReasonFragmentationNeeded is an error where a packet is to big to be sent
-// out through the outgoing MTU, as per RFC 4443 page 9, Packet Too Big Message.
-type icmpReasonPacketTooBig struct{}
+// icmpReasonPacketTooBig is an error where a packet is too big to be sent out
+// through the outgoing MTU, as per RFC 4443 page 9, Packet Too Big Message.
+type icmpReasonPacketTooBig struct {
+	// mtu is the MTU of the next-hop link.
+	mtu uint32
+}
 
 func (*icmpReasonPacketTooBig) isICMPReason() {}
 
@@ -1167,7 +1170,9 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer, deliv
 		case *icmpReasonHostUnreachable:
 			return header.ICMPv6DstUnreachable, header.ICMPv6AddressUnreachable, sent.dstUnreachable, 0
 		case *icmpReasonPacketTooBig:
-			return header.ICMPv6PacketTooBig, header.ICMPv6UnusedCode, sent.packetTooBig, 0
+			// As per RFC 4443 section 3.2, the MTU field holds the MTU of the
+			// next-hop link.
+			return header.ICMPv6PacketTooBig, header.ICMPv6UnusedCode, sent.packetTooBig, reason.mtu
 		case *icmpReasonHopLimitExceeded:
 			return header.ICMPv6TimeExceeded, header.ICMPv6HopLimitExceeded, sent.timeExceeded, 0
 		case *icmpReasonReassemblyTimeout:

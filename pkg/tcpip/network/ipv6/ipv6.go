@@ -1027,6 +1027,21 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer, protocol
 
 	if packetMustBeFragmented(pkt, networkMTU) {
 		if pkt.NetworkPacketInfo.IsForwardedPacket {
+			if header.IPv6(pkt.NetworkHeader().Slice()).TransportProtocol() == header.TCPProtocolNumber && ip.CanSegmentTCP(pkt, networkMTU) {
+				// A forwarded TCP packet coalesced from segments that fit the
+				// link: resegment it, as a NIC with TCP segmentation offload
+				// would.
+				sent, remain, err := ip.SegmentTCP(pkt, int(r.MaxHeaderLength()), func(seg *stack.PacketBuffer, _ int, tcpLen uint16) uint16 {
+					segHdr := header.IPv6(seg.NetworkHeader().Slice())
+					segHdr.SetPayloadLength(tcpLen)
+					return header.PseudoHeaderChecksum(header.TCPProtocolNumber, segHdr.SourceAddress(), segHdr.DestinationAddress(), tcpLen)
+				}, func(seg *stack.PacketBuffer) tcpip.Error {
+					return e.nic.WritePacket(r, seg)
+				})
+				stats.PacketsSent.IncrementBy(uint64(sent))
+				stats.OutgoingPacketErrors.IncrementBy(uint64(remain))
+				return err
+			}
 			// As per RFC 2460, section 4.5:
 			//   Unlike IPv4, fragmentation in IPv6 is performed only by source nodes,
 			//   not by routers along a packet's delivery path.
@@ -1239,6 +1254,13 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		return &ip.ErrUnknownOutputEndpoint{}
 	}
 
+	// A TCP packet may have been coalesced from several segments by GRO (in
+	// netstack or in the host). Record the segment size so that the packet can
+	// be resegmented if it does not fit the outgoing link.
+	if h.TransportProtocol() == header.TCPProtocolNumber {
+		newPkt.GROSegmentSize = ip.ForwardedTCPSegmentSize(pkt, e.nic.MTU(), forwardToEp.nic.MTU())
+	}
+
 	switch err := forwardToEp.writePacket(route, newPkt, newPkt.TransportProtocolNumber, true /* headerIncluded */); err.(type) {
 	case nil:
 		return nil
@@ -1247,7 +1269,9 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 		//   A Packet Too Big MUST be sent by a router in response to a packet that
 		//   it cannot forward because the packet is larger than the MTU of the
 		//   outgoing link.
-		_ = e.protocol.returnError(&icmpReasonPacketTooBig{}, pkt, false /* deliveredLocally */)
+		_ = e.protocol.returnError(&icmpReasonPacketTooBig{
+			mtu: forwardToEp.nic.MTU(),
+		}, pkt, false /* deliveredLocally */)
 		return &ip.ErrMessageTooLong{}
 	case *tcpip.ErrNoBufferSpace:
 		return &ip.ErrOutgoingDeviceNoBufferSpace{}

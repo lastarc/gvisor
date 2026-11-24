@@ -18,7 +18,9 @@ import (
 	"math/bits"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -63,5 +65,86 @@ func TestFlushDrainsBucket(t *testing.T) {
 	}
 	if got := bucket.count; got != 0 {
 		t.Errorf("Flush left %d packets in bucket, want 0", got)
+	}
+}
+
+type recordingDispatcher struct {
+	pkts []*stack.PacketBuffer
+}
+
+func (d *recordingDispatcher) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	d.pkts = append(d.pkts, pkt.IncRef())
+}
+
+func (*recordingDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
+}
+
+func newTCPv4Packet(seq uint32, payloadLen int) *stack.PacketBuffer {
+	b := make([]byte, header.IPv4MinimumSize+header.TCPMinimumSize+payloadLen)
+	header.IPv4(b).Encode(&header.IPv4Fields{
+		TotalLength: uint16(len(b)),
+		Protocol:    uint8(header.TCPProtocolNumber),
+		TTL:         64,
+		SrcAddr:     tcpip.AddrFrom4([4]byte{10, 0, 0, 1}),
+		DstAddr:     tcpip.AddrFrom4([4]byte{10, 0, 0, 2}),
+	})
+	header.TCP(b[header.IPv4MinimumSize:]).Encode(&header.TCPFields{
+		SrcPort:    80,
+		DstPort:    1234,
+		SeqNum:     seq,
+		AckNum:     1,
+		DataOffset: header.TCPMinimumSize,
+		Flags:      header.TCPFlagAck,
+		WindowSize: 65535,
+	})
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
+	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
+	pkt.RXChecksumValidated = true
+	return pkt
+}
+
+// TestNoMergeOfLargerSegment tests that a segment larger than the first one
+// in a flow is not coalesced into it, so that GROSegmentSize never understates
+// the size of the coalesced segments.
+func TestNoMergeOfLargerSegment(t *testing.T) {
+	dispatcher := &recordingDispatcher{}
+	gd := GRO{Dispatcher: dispatcher}
+	gd.Init(true)
+	defer func() {
+		for _, pkt := range dispatcher.pkts {
+			pkt.DecRef()
+		}
+	}()
+
+	// A short segment (e.g. the tail of a segment re-cut after an MSS
+	// reduction) followed by two full ones.
+	seq := uint32(1000)
+	for _, size := range []int{14, 1434, 1434} {
+		pkt := newTCPv4Packet(seq, size)
+		gd.Enqueue(pkt)
+		pkt.DecRef()
+		seq += uint32(size)
+	}
+	gd.Flush()
+
+	type result struct {
+		payload        int
+		groSegmentSize uint16
+	}
+	var got []result
+	for _, pkt := range dispatcher.pkts {
+		got = append(got, result{
+			payload:        pkt.Data().Size() - header.IPv4MinimumSize - header.TCPMinimumSize,
+			groSegmentSize: pkt.GROSegmentSize,
+		})
+	}
+	want := []result{{payload: 14}, {payload: 2 * 1434, groSegmentSize: 1434}}
+	if len(got) != len(want) {
+		t.Fatalf("got delivered packets %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("packet %d: got %+v, want %+v", i, got[i], want[i])
+		}
 	}
 }

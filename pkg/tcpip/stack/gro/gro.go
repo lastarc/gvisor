@@ -133,6 +133,10 @@ func (gb *groBucket) findGROPacket4(pkt *stack.PacketBuffer, ipHdr header.IPv4, 
 			return groPkt, true
 		}
 
+		if largerThanFlow(groPkt, pkt) {
+			return groPkt, true
+		}
+
 		// There's an upper limit on coalesced packet size.
 		if pkt.Data().Size()-header.IPv4MinimumSize-int(tcpHdr.DataOffset())+groPkt.pkt.Data().Size() >= groMaxPacketSize {
 			return groPkt, true
@@ -184,6 +188,10 @@ func (gb *groBucket) findGROPacket6(pkt *stack.PacketBuffer, ipHdr header.IPv6, 
 
 		// Do the traffic class and hop limit match?
 		if trafficClass != groTrafficClass || ipHdr.HopLimit() != groIPHdr.HopLimit() {
+			return groPkt, true
+		}
+
+		if largerThanFlow(groPkt, pkt) {
 			return groPkt, true
 		}
 
@@ -576,6 +584,16 @@ func (gd *GRO) String() string {
 		ret += "\n"
 	}
 	return ret
+}
+
+// largerThanFlow returns whether pkt is larger than the first packet of
+// groPkt's flow. Such a packet cannot continue the flow: peers send equally
+// sized segments until they run out of data. Merging it would also make
+// GROSegmentSize understate the size of the coalesced packet's segments, which
+// IP forwarding relies on to resegment it. Like Linux, flush groPkt and start
+// a new flow instead.
+func largerThanFlow(groPkt *groPacket, pkt *stack.PacketBuffer) bool {
+	return pkt.Data().Size() > groPkt.initialLength
 }
 
 // shouldFlushTCP returns whether the TCP headers indicate that groPkt should

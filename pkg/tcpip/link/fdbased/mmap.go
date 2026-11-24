@@ -170,7 +170,7 @@ func (d *packetMMapDispatcher) readMMappedPackets() (stack.PacketBufferList, boo
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithView(buffer.NewViewWithData(hdr.Payload())),
 		})
-		if d.e.gsoKind == stack.HostGSOSupported {
+		if d.e.usesVnetHdr() {
 			// The kernel writes virtioNetHdr just before the packet.
 			pkt.GROSegmentSize = groSegmentSize(hdr[int(hdr.tpMac())-virtioNetHdrSize:])
 		}

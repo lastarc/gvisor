@@ -617,8 +617,11 @@ func TestDispatchPacketFormat(t *testing.T) {
 		name          string
 		newDispatcher func(fd int, e *endpoint, opts *Options) (linkDispatcher, error)
 		vnetHdr       []byte
-		ethHdr        []byte
-		netHdr        []byte
+		// noHostGSO is whether the socket has PACKET_VNET_HDR enabled without
+		// host GSO (Options.VnetHdr).
+		noHostGSO bool
+		ethHdr    []byte
+		netHdr    []byte
 	}{
 		{
 			name:          "readVDispatcher",
@@ -655,6 +658,30 @@ func TestDispatchPacketFormat(t *testing.T) {
 			name:          "recvMMsgDispatcherHostGRO",
 			newDispatcher: newRecvMMsgDispatcher,
 			vnetHdr:       groVnetHdr,
+			ethHdr: []byte{
+				1, 2, 3, 4, 5, 60,
+				1, 2, 3, 4, 5, 61,
+				8, 0,
+			},
+			netHdr: []byte{0x40, 0, 0, 0},
+		},
+		{
+			name:          "readVDispatcherVnetHdrWithoutGSO",
+			newDispatcher: newReadVDispatcher,
+			vnetHdr:       groVnetHdr,
+			noHostGSO:     true,
+			ethHdr: []byte{
+				1, 2, 3, 4, 5, 60,
+				1, 2, 3, 4, 5, 61,
+				8, 0,
+			},
+			netHdr: []byte{0x40, 0, 0, 0},
+		},
+		{
+			name:          "recvMMsgDispatcherVnetHdrWithoutGSO",
+			newDispatcher: newRecvMMsgDispatcher,
+			vnetHdr:       groVnetHdr,
+			noHostGSO:     true,
 			ethHdr: []byte{
 				1, 2, 3, 4, 5, 60,
 				1, 2, 3, 4, 5, 61,
@@ -726,7 +753,7 @@ func TestDispatchPacketFormat(t *testing.T) {
 				addr = tcpip.LinkAddress(test.ethHdr[:header.EthernetAddressSize])
 			}
 			gsoKind := stack.GSONotSupported
-			if len(test.vnetHdr) > 0 {
+			if len(test.vnetHdr) > 0 && !test.noHostGSO {
 				gsoKind = stack.HostGSOSupported
 			}
 			d, err := test.newDispatcher(fds[0], &endpoint{
@@ -734,6 +761,7 @@ func TestDispatchPacketFormat(t *testing.T) {
 				hdrSize:    len(test.ethHdr),
 				dispatcher: sink,
 				gsoKind:    gsoKind,
+				vnetHdr:    len(test.vnetHdr) > 0 && test.noHostGSO,
 			}, &Options{ProcessorsPerChannel: 1})
 			if err != nil {
 				t.Fatal(err)
@@ -896,5 +924,59 @@ func BenchmarkIovecBuffer(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// TestWritePacketVnetHdrWithoutGSO tests that, with PACKET_VNET_HDR enabled
+// but without host GSO, written packets are preceded by a virtio-net header
+// that requests no offload.
+func TestWritePacketVnetHdrWithoutGSO(t *testing.T) {
+	for _, gvisorGSO := range []bool{false, true} {
+		t.Run(fmt.Sprintf("GVisorGSO=%t", gvisorGSO), func(t *testing.T) {
+			opts := &Options{Address: laddr, MTU: mtu, EthernetHeader: true, VnetHdr: true}
+			if gvisorGSO {
+				opts.GSOMaxSize = 32768
+				opts.GVisorGSOEnabled = true
+			}
+			c := newContext(t, opts)
+			defer c.cleanup()
+
+			payload := []byte{1, 2, 3, 4}
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
+				Payload:            buffer.MakeWithData(payload),
+			})
+			defer pkt.DecRef()
+			pkt.EgressRoute.LocalLinkAddress = laddr
+			pkt.EgressRoute.RemoteLinkAddress = raddr
+			pkt.NetworkProtocolNumber = proto
+			if gvisorGSO {
+				// Must not be translated into a host GSO request.
+				pkt.GSOOptions = stack.GSO{Type: stack.GSOGvisor, MSS: 1}
+			}
+			c.ep.AddHeader(pkt)
+
+			var pkts stack.PacketBufferList
+			pkts.PushBack(pkt)
+			if _, err := c.ep.WritePackets(pkts); err != nil {
+				t.Fatalf("WritePackets failed: %s", err)
+			}
+
+			b := make([]byte, mtu)
+			n, err := unix.Read(c.readFDs[0], b)
+			if err != nil {
+				t.Fatalf("Read failed: %v", err)
+			}
+			b = b[:n]
+			if want := virtioNetHdrSize + header.EthernetMinimumSize + len(payload); len(b) != want {
+				t.Fatalf("Read returned %d bytes, want %d", len(b), want)
+			}
+			if got, want := b[:virtioNetHdrSize], make([]byte, virtioNetHdrSize); !bytes.Equal(got, want) {
+				t.Errorf("got virtio-net header %x, want %x", got, want)
+			}
+			if got := b[virtioNetHdrSize+header.EthernetMinimumSize:]; !bytes.Equal(got, payload) {
+				t.Errorf("got payload %x, want %x", got, payload)
+			}
+		})
 	}
 }

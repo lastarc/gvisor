@@ -68,14 +68,17 @@ type Neighbor struct {
 
 // FDBasedLink configures an fd-based link.
 type FDBasedLink struct {
-	Name              string
-	InterfaceIndex    int
-	MTU               int
-	Multicast         bool
-	Addresses         []IPWithPrefix
-	Routes            []Route
-	GSOMaxSize        uint32
-	GVisorGSOEnabled  bool
+	Name             string
+	InterfaceIndex   int
+	MTU              int
+	Multicast        bool
+	Addresses        []IPWithPrefix
+	Routes           []Route
+	GSOMaxSize       uint32
+	GVisorGSOEnabled bool
+	// VnetHdr indicates that the link's AF_PACKET sockets have
+	// PACKET_VNET_HDR enabled even though host GSO is not used.
+	VnetHdr           bool
 	GVisorGRO         bool
 	TXChecksumOffload bool
 	RXChecksumOffload bool

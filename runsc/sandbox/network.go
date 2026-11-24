@@ -642,10 +642,14 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 				}
 				if j == 0 {
 					link.GSOMaxSize = socketEntry.gsoMaxSize
+					link.VnetHdr = socketEntry.vnetHdr
 				} else {
 					if link.GSOMaxSize != socketEntry.gsoMaxSize {
 						return 0, fmt.Errorf("inconsistent gsoMaxSize %d and %d when creating multiple channels for same interface: %s",
 							link.GSOMaxSize, socketEntry.gsoMaxSize, link.Name)
+					}
+					if link.VnetHdr != socketEntry.vnetHdr {
+						return 0, fmt.Errorf("inconsistent PACKET_VNET_HDR when creating multiple channels for same interface: %s", link.Name)
 					}
 				}
 				args.FilePayload.Files = append(args.FilePayload.Files, socketEntry.deviceFile)
@@ -840,6 +844,7 @@ func isAddressOnInterface(ifaceName string, addr *net.IPNet) (bool, error) {
 type socketEntry struct {
 	deviceFile *os.File
 	gsoMaxSize uint32
+	vnetHdr    bool
 }
 
 // createSocket creates an underlying AF_PACKET socket and configures it for
@@ -863,6 +868,7 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 	}
 
 	gsoMaxSize := uint32(0)
+	vnetHdr := false
 	if enableGSO {
 		gso, err := isGSOEnabled(fd, iface.Name)
 		if err != nil {
@@ -873,8 +879,21 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 				return nil, fmt.Errorf("unable to enable the PACKET_VNET_HDR option: %v", err)
 			}
 			gsoMaxSize = ifaceLink.Attrs().GSOMaxSize
+			vnetHdr = true
 		} else {
 			log.Infof("GSO not available in host.")
+		}
+	}
+	if !vnetHdr {
+		// Even without host GSO, the host may hand over packets that it
+		// coalesced (e.g. TSO/GSO packets from a local peer, or GRO). The
+		// virtio-net header carries their segment size, which netstack needs
+		// to forward them correctly. This is best effort: without it,
+		// netstack falls back to inferring segment sizes.
+		if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR, 1); err != nil {
+			log.Infof("Unable to enable the PACKET_VNET_HDR option on %q: %v", iface.Name, err)
+		} else {
+			vnetHdr = true
 		}
 	}
 
@@ -902,7 +921,7 @@ func createSocket(iface net.Interface, ifaceLink netlink.Link, enableGSO bool) (
 		}
 	}
 
-	return &socketEntry{deviceFile, gsoMaxSize}, nil
+	return &socketEntry{deviceFile, gsoMaxSize, vnetHdr}, nil
 }
 
 // loopbackLink returns the link with addresses and routes for a loopback
