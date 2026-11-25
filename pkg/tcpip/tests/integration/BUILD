@@ -212,6 +212,8 @@ go_test(
         "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/link/ethernet",
+        "//pkg/tcpip/link/nested",
         "//pkg/tcpip/link/veth",
         "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/ipv4",

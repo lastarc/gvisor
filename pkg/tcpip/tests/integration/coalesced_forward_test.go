@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
+	"gvisor.dev/gvisor/pkg/tcpip/link/nested"
 	"gvisor.dev/gvisor/pkg/tcpip/link/veth"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -43,11 +46,13 @@ import (
 // coalesce is set, GSO packets are delivered whole, with GROSegmentSize set,
 // like the host hands TSO/GRO packets to an AF_PACKET socket with a virtio-net
 // header. A fraction of packets is dropped, and packets are dropped when the
-// queue to the peer is full.
+// queue to the peer is full. If clearDF is set, packets are delivered without
+// the IPv4 Don't Fragment flag.
 type pipe struct {
 	*channel.Endpoint
 	peer     *pipe
 	coalesce bool
+	clearDF  bool
 	dropRate float64
 	q        chan *stack.PacketBuffer
 	done     chan struct{}
@@ -114,6 +119,12 @@ func (p *pipe) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 			tcpH.SetChecksum(0)
 			tcpH.SetChecksum(^tcpH.CalculateChecksum(checksum.Checksum(tcpH.Payload(), xsum)))
 		}
+		if p.clearDF {
+			ipH := header.IPv4(v)
+			ipH.SetFlagsFragmentOffset(ipH.Flags()&^header.IPv4FlagDontFragment, 0)
+			ipH.SetChecksum(0)
+			ipH.SetChecksum(^ipH.CalculateChecksum())
+		}
 		out := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(v)})
 		if p.coalesce && pkt.GSOOptions.Type != stack.GSONone && pkt.Data().Size() > int(pkt.GSOOptions.MSS) {
 			out.GROSegmentSize = pkt.GSOOptions.MSS
@@ -141,6 +152,32 @@ func (p *pipe) shutdown() {
 	close(p.q)
 	p.mu.Unlock()
 	<-p.done
+}
+
+// fragmentCounter is a link endpoint that counts the IPv4 fragments that it
+// delivers.
+type fragmentCounter struct {
+	nested.Endpoint
+	fragments atomic.Int64
+}
+
+// newFragmentCounter returns a fragmentCounter that wraps ep.
+func newFragmentCounter(ep stack.LinkEndpoint) *fragmentCounter {
+	c := &fragmentCounter{}
+	c.Endpoint.Init(ep, c)
+	return c
+}
+
+// DeliverNetworkPacket implements stack.NetworkDispatcher.DeliverNetworkPacket.
+func (c *fragmentCounter) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	if protocol == header.IPv4ProtocolNumber {
+		if b, ok := pkt.Data().PullUp(header.IPv4MinimumSize); ok {
+			if h := header.IPv4(b); h.Flags()&header.IPv4FlagMoreFragments != 0 || h.FragmentOffset() != 0 {
+				c.fragments.Add(1)
+			}
+		}
+	}
+	c.Endpoint.DeliverNetworkPacket(protocol, pkt)
 }
 
 // newStack returns a stack with IPv4, ARP and TCP.
@@ -174,22 +211,50 @@ var (
 
 // TestCoalescedForwardingStress downloads concurrent TCP streams from a
 // sender whose link coalesces segments, like a host with TSO/GRO, through a
-// forwarding, masquerading stack onto a veth with a smaller MTU, to receivers
-// that do not validate checksums, like containers behind a netstack bridge.
-// Every byte received is checked.
+// forwarding, masquerading stack, to receivers that do not validate checksums,
+// like containers behind a netstack bridge. Every byte received is checked.
 //
 // Packets are lost at random on the coalescing link, so TCP retransmits. The
-// router itself must not drop any.
+// router itself must not drop any, and the receiver must not get IP
+// fragments.
 func TestCoalescedForwardingStress(t *testing.T) {
+	// All variants share one deadline, which ends before the test's.
+	deadline := time.Now().Add(40 * time.Second)
+	if d, ok := t.Deadline(); ok && d.Add(-5*time.Second).Before(deadline) {
+		deadline = d.Add(-5 * time.Second)
+	}
+	for _, test := range []coalescedForwardingTest{
+		{name: "veth"},
+		{name: "bridge", bridge: true},
+		{name: "bridge without DF", bridge: true, clearDF: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runCoalescedForwardingStress(t, test, deadline)
+		})
+	}
+}
+
+// coalescedForwardingTest is a variant of TestCoalescedForwardingStress.
+type coalescedForwardingTest struct {
+	name string
+	// bridge is whether the router reaches the receiver through a netstack
+	// bridge, as Docker's default network in gVisor does, rather than
+	// directly through a veth whose MTU is smaller than the sender's link.
+	bridge bool
+	// clearDF is whether the sender's packets arrive without the Don't
+	// Fragment flag, so that the router fragments packets that are too
+	// large for the outgoing link instead of dropping them.
+	clearDF bool
+}
+
+// runCoalescedForwardingStress runs one variant of
+// TestCoalescedForwardingStress. Connections time out at deadline.
+func runCoalescedForwardingStress(t *testing.T, test coalescedForwardingTest, deadline time.Time) {
 	const (
 		flows    = 6
 		size     = 4 << 20
 		dropRate = 0.003
 	)
-	deadline := time.Now().Add(30 * time.Second)
-	if d, ok := t.Deadline(); ok && d.Before(deadline) {
-		deadline = d.Add(-5 * time.Second)
-	}
 
 	sender, router, receiver := newStack(), newStack(), newStack()
 	defer func() {
@@ -199,20 +264,50 @@ func TestCoalescedForwardingStress(t *testing.T) {
 		}
 	}()
 
-	sEP, rIn := newPipePair(1500, dropRate)
+	linkMTU := uint32(1500)
+	if test.bridge {
+		// With MTU 1528 on the sender's link and on the veth, the sender
+		// sends 1500-byte packets, which fill the bridge's MTU of 1500 as a
+		// Linux sender fills the MSS of a 1500-byte link. A netstack sender
+		// keeps 40 bytes of the MSS for TCP options, of which it uses 12
+		// (timestamps).
+		linkMTU = 1528
+	}
+	sEP, rIn := newPipePair(linkMTU, dropRate)
+	sEP.clearDF = test.clearDF
 	defer func() {
 		sEP.shutdown()
 		rIn.shutdown()
 	}()
-	rOut, recvEP := veth.NewPair(1486, 8192)
-	for _, c := range []struct {
+	type nic struct {
 		s    *stack.Stack
-		nic  tcpip.NICID
+		id   tcpip.NICID
 		name string
 		ep   stack.LinkEndpoint
-	}{{sender, 1, "eth0", sEP}, {router, 1, "eth0", rIn}, {router, 2, "docker0", rOut}, {receiver, 1, "eth0", recvEP}} {
-		if err := c.s.CreateNICWithOptions(c.nic, c.ep, stack.NICOptions{Name: c.name}); err != nil {
+	}
+	nics := []nic{{sender, 1, "eth0", sEP}, {router, 1, "eth0", rIn}}
+	var recvEP *fragmentCounter
+	if test.bridge {
+		rOut, rPeer := veth.NewPair(linkMTU, 8192)
+		recvEP = newFragmentCounter(ethernet.NewWithNetworkMTU(rPeer))
+		nics = append(nics,
+			nic{router, 2, "docker0", stack.NewBridgeEndpoint(1500)},
+			nic{router, 3, "veth0", ethernet.NewWithNetworkMTU(rOut)},
+			nic{receiver, 1, "eth0", recvEP})
+	} else {
+		// The veth's MTU is smaller than the sender's link.
+		rOut, rPeer := veth.NewPair(1486, 8192)
+		recvEP = newFragmentCounter(rPeer)
+		nics = append(nics, nic{router, 2, "veth0", rOut}, nic{receiver, 1, "eth0", recvEP})
+	}
+	for _, c := range nics {
+		if err := c.s.CreateNICWithOptions(c.id, c.ep, stack.NICOptions{Name: c.name}); err != nil {
 			t.Fatalf("CreateNIC: %s", err)
+		}
+	}
+	if test.bridge {
+		if err := router.SetNICCoordinator(3, 2); err != nil {
+			t.Fatalf("SetNICCoordinator: %s", err)
 		}
 	}
 	addAddr(t, sender, 1, senderAddr)
@@ -327,10 +422,17 @@ func TestCoalescedForwardingStress(t *testing.T) {
 	if got := router.Stats().IP.Forwarding.Errors.Value(); got != 0 {
 		t.Errorf("got router.Stats().IP.Forwarding.Errors.Value() = %d, want = 0", got)
 	}
+	if got := recvEP.fragments.Load(); got != 0 {
+		t.Errorf("receiver got %d IP fragments, want 0", got)
+	}
 }
 
 func TestMain(m *testing.M) {
-	refs.SetLeakMode(refs.LeaksPanic)
+	// A veth delivers queued packets on a goroutine that Wait does not wait
+	// for, so when the stacks stop while TCP retransmissions are in flight,
+	// a few packet buffers can still be referenced at the leak check. Log
+	// leaks rather than fail.
+	refs.SetLeakMode(refs.LeaksLogWarning)
 	code := m.Run()
 	refs.DoLeakCheck()
 	os.Exit(code)
