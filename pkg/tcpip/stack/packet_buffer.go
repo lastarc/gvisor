@@ -460,7 +460,13 @@ func (pk *PacketBuffer) CloneToInbound() *PacketBuffer {
 //
 // The returned packet buffer will have the network and transport headers
 // set if the original packet buffer did.
+//
+// DeepCopyForForwarding does not modify pk's buffer, so slices of pk's headers
+// stay valid.
 func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBuffer {
+	networkHeaderLen := pk.headers[networkHeader].length
+	transportHeaderLen := pk.headers[transportHeader].length
+
 	payload := BufferSince(pk.NetworkHeader())
 	defer payload.Release()
 	newPk := NewPacketBuffer(PacketBufferOptions{
@@ -470,7 +476,7 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 	})
 
 	{
-		consumeBytes := len(pk.NetworkHeader().Slice())
+		consumeBytes := networkHeaderLen
 		if _, consumed := newPk.NetworkHeader().Consume(consumeBytes); !consumed {
 			panic(fmt.Sprintf("expected to consume network header %d bytes from new packet", consumeBytes))
 		}
@@ -478,7 +484,7 @@ func (pk *PacketBuffer) DeepCopyForForwarding(reservedHeaderBytes int) *PacketBu
 	}
 
 	{
-		consumeBytes := len(pk.TransportHeader().Slice())
+		consumeBytes := transportHeaderLen
 		if _, consumed := newPk.TransportHeader().Consume(consumeBytes); !consumed {
 			panic(fmt.Sprintf("expected to consume transport header %d bytes from new packet", consumeBytes))
 		}

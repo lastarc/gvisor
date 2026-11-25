@@ -943,3 +943,57 @@ func BenchmarkPacketDataReadTo(b *testing.B) {
 		}
 	}
 }
+
+func TestDeepCopyForForwardingKeepsHeaders(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		netHdrLen    int
+		sharedOnCopy bool
+	}{
+		{name: "IPv4", netHdrLen: header.IPv4MinimumSize},
+		{name: "IPv6", netHdrLen: header.IPv6MinimumSize},
+		{name: "IPv4 shared buffer", netHdrLen: header.IPv4MinimumSize, sharedOnCopy: true},
+		{name: "IPv6 shared buffer", netHdrLen: header.IPv6MinimumSize, sharedOnCopy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, tc.netHdrLen+header.TCPMinimumSize+100)
+			for i := range data {
+				data[i] = byte(i)
+			}
+			pkt := NewPacketBuffer(PacketBufferOptions{Payload: buffer.MakeWithData(data)})
+			defer pkt.DecRef()
+			if _, ok := pkt.NetworkHeader().Consume(tc.netHdrLen); !ok {
+				t.Fatalf("pkt.NetworkHeader().Consume(%d) failed", tc.netHdrLen)
+			}
+			if _, ok := pkt.TransportHeader().Consume(header.TCPMinimumSize); !ok {
+				t.Fatalf("pkt.TransportHeader().Consume(%d) failed", header.TCPMinimumSize)
+			}
+			netHdr := pkt.NetworkHeader().Slice()
+			tcpHdr := pkt.TransportHeader().Slice()
+			var clone *PacketBuffer
+			if tc.sharedOnCopy {
+				clone = pkt.Clone()
+			}
+
+			newPkt := pkt.DeepCopyForForwarding(0 /* reservedHeaderBytes */)
+			if got, want := newPkt.NetworkHeader().Slice(), data[:tc.netHdrLen]; !bytes.Equal(got, want) {
+				t.Errorf("got newPkt.NetworkHeader().Slice() = %x, want = %x", got, want)
+			}
+			if got, want := newPkt.TransportHeader().Slice(), data[tc.netHdrLen:][:header.TCPMinimumSize]; !bytes.Equal(got, want) {
+				t.Errorf("got newPkt.TransportHeader().Slice() = %x, want = %x", got, want)
+			}
+			newPkt.DecRef()
+			if clone != nil {
+				clone.DecRef()
+			}
+
+			// The header slices taken before the copy must still be pkt's.
+			if got := pkt.NetworkHeader().Slice(); &got[0] != &netHdr[0] {
+				t.Errorf("network header moved from %p to %p", &netHdr[0], &got[0])
+			}
+			if got := pkt.TransportHeader().Slice(); &got[0] != &tcpHdr[0] {
+				t.Errorf("transport header moved from %p to %p", &tcpHdr[0], &got[0])
+			}
+		})
+	}
+}
