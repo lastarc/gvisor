@@ -618,12 +618,27 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	defer mnt.EndWrite()
 
 	oldParentDir := oldParentVD.Dentry().Impl().(*dentry).inode.impl.(*directory)
-	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
 		return err
 	}
 	renamed, ok := oldParentDir.childMap[oldName]
 	if !ok {
 		return linuxerr.ENOENT
+	}
+	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayExec); err != nil {
+		return err
+	}
+	replaced, haveReplaced := newParentDir.childMap[newName]
+	// A rename or exchange onto the same name, or between links to the same
+	// file, does nothing. Like Linux, check this before the write permission
+	// checks.
+	if haveReplaced && opts.Flags&linux.RENAME_NOREPLACE == 0 && isSameFile(renamed, replaced) {
+		if renamed.inode.isDir() || (!opts.MustBeDir && !rp.MustBeDir()) {
+			return nil
+		}
+	}
+	if err := oldParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
+		return err
 	}
 	if err := oldParentDir.mayDelete(rp.Credentials(), renamed); err != nil {
 		return err
@@ -647,11 +662,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 	}
 
-	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := newParentDir.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return err
 	}
-	replaced, ok := newParentDir.childMap[newName]
-	if ok {
+	if haveReplaced {
 		if opts.Flags&linux.RENAME_NOREPLACE != 0 {
 			return linuxerr.EEXIST
 		}
@@ -714,13 +728,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		return linuxerr.ENOENT
 	}
 
-	// Linux places this check before some of those above; we do it here for
-	// simplicity, under the assumption that applications are not intentionally
-	// doing noop renames expecting them to succeed where non-noop renames
-	// would fail.
-	if renamed == replaced {
-		return nil
-	}
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
@@ -791,6 +798,22 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 
 	vfs.InotifyRename(ctx, &renamed.inode.watches, &oldParentDir.inode.watches, &newParentDir.inode.watches, oldName, newName, renamed.inode.isDir())
 	return nil
+}
+
+// isSameFile returns true if d1 and d2 are the same dentry, or links to the
+// same file. All whiteout devices share one inode, but are different files.
+// On Linux, each whiteout made with mknod has its own inode.
+//
+// Precondition: d1.inode.fs.mu must be locked.
+func isSameFile(d1, d2 *dentry) bool {
+	if d1 == d2 {
+		return true
+	}
+	if d1.inode != d2.inode || d1.inode.isDir() {
+		return false
+	}
+	dev, ok := d1.inode.impl.(*deviceFile)
+	return !ok || d1.inode.fs.ovlWhiteout != dev
 }
 
 // RmdirAt implements vfs.FilesystemImpl.RmdirAt.

@@ -18,7 +18,10 @@
 #include <linux/limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <string>
@@ -33,6 +36,8 @@
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
+#include "test/util/mount_util.h"
+#include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
 #include "test/util/temp_path.h"
@@ -206,6 +211,212 @@ TEST(RenameTest, FileOverwritesFile) {
   std::string f2_contents;
   ASSERT_NO_ERRNO(GetContents(f2.path(), &f2_contents));
   EXPECT_EQ("first", f2_contents);
+}
+
+TEST(RenameTest, FileOverwritesLinkToSameFile) {
+  // gVisor's FUSE client sends a rename between links to the same file to the
+  // FUSE server.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir.path(), "contents", TempPath::kDefaultFileMode));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  int inotify_fd;
+  ASSERT_THAT(inotify_fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor inotify(inotify_fd);
+  ASSERT_THAT(
+      inotify_add_watch(inotify.get(), dir.path().c_str(), IN_ALL_EVENTS),
+      SyscallSucceeds());
+
+  const struct stat dir_before = ASSERT_NO_ERRNO_AND_VALUE(Stat(dir.path()));
+  const struct stat file_before = ASSERT_NO_ERRNO_AND_VALUE(Stat(file.path()));
+
+  // A rename between two links to the same file does nothing.
+  ASSERT_THAT(rename(file.path().c_str(), link_path.c_str()),
+              SyscallSucceeds());
+  char event_buf[256];
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(link_path), IsPosixErrorOkAndHolds(true));
+  const struct stat dir_after = ASSERT_NO_ERRNO_AND_VALUE(Stat(dir.path()));
+  const struct stat file_stat = ASSERT_NO_ERRNO_AND_VALUE(Stat(file.path()));
+  const struct stat link_stat = ASSERT_NO_ERRNO_AND_VALUE(Stat(link_path));
+  EXPECT_EQ(file_stat.st_ino, link_stat.st_ino);
+  EXPECT_EQ(file_stat.st_nlink, 2);
+  EXPECT_EQ(dir_after.st_mtim.tv_sec, dir_before.st_mtim.tv_sec);
+  EXPECT_EQ(dir_after.st_mtim.tv_nsec, dir_before.st_mtim.tv_nsec);
+  EXPECT_EQ(file_stat.st_ctim.tv_sec, file_before.st_ctim.tv_sec);
+  EXPECT_EQ(file_stat.st_ctim.tv_nsec, file_before.st_ctim.tv_nsec);
+
+  // Unlinking each name removes one link.
+  ASSERT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(1));
+}
+
+// After a rename between links to the same file, the file stays usable.
+TEST(RenameTest, LinkOverwritesLinkToSameFileThenLink) {
+  // gVisor's FUSE client sends a rename between links to the same file to the
+  // FUSE server.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir.path(), "contents", TempPath::kDefaultFileMode));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+
+  ASSERT_THAT(rename(link_path.c_str(), file.path().c_str()),
+              SyscallSucceeds());
+  const std::string link2_path = JoinPath(dir.path(), "link2");
+  ASSERT_THAT(link(file.path().c_str(), link2_path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Links(link_path), IsPosixErrorOkAndHolds(3));
+  EXPECT_THAT(GetContents(link2_path), IsPosixErrorOkAndHolds("contents"));
+}
+
+// After a rename between links to the same file, xattr calls on both names
+// work.
+TEST(RenameTest, LinkOverwritesLinkToSameFileThenXattr) {
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  if (setxattr(file.path().c_str(), "user.a", "1", 1, 0) != 0) {
+    ASSERT_EQ(errno, EOPNOTSUPP);
+    GTEST_SKIP() << "user xattrs are not supported";
+  }
+  ASSERT_THAT(rename(link_path.c_str(), file.path().c_str()),
+              SyscallSucceeds());
+  for (const std::string& p : {file.path(), link_path}) {
+    SCOPED_TRACE(p);
+    char buf[8];
+    EXPECT_THAT(getxattr(p.c_str(), "user.a", buf, sizeof(buf)),
+                SyscallSucceedsWithValue(1));
+    EXPECT_THAT(listxattr(p.c_str(), buf, sizeof(buf)), SyscallSucceeds());
+  }
+  EXPECT_THAT(setxattr(link_path.c_str(), "user.b", "2", 1, 0),
+              SyscallSucceeds());
+  EXPECT_THAT(removexattr(link_path.c_str(), "user.a"), SyscallSucceeds());
+}
+
+TEST(RenameTest, FileOverwritesLinkToSameFileInOtherDirectory) {
+  // gVisor's FUSE client sends a rename between links to the same file to the
+  // FUSE server.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto dir1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto dir2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir1.path(), "contents", TempPath::kDefaultFileMode));
+  const std::string link_path = JoinPath(dir2.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  int inotify_fd;
+  ASSERT_THAT(inotify_fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor inotify(inotify_fd);
+  ASSERT_THAT(
+      inotify_add_watch(inotify.get(), dir1.path().c_str(), IN_ALL_EVENTS),
+      SyscallSucceeds());
+  ASSERT_THAT(
+      inotify_add_watch(inotify.get(), dir2.path().c_str(), IN_ALL_EVENTS),
+      SyscallSucceeds());
+
+  // A rename between two links to the same file does nothing.
+  ASSERT_THAT(rename(file.path().c_str(), link_path.c_str()),
+              SyscallSucceeds());
+  char event_buf[256];
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(GetContents(file.path()), IsPosixErrorOkAndHolds("contents"));
+  EXPECT_THAT(GetContents(link_path), IsPosixErrorOkAndHolds("contents"));
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(2));
+}
+
+// Separate whiteout devices (character devices with device number 0:0) are
+// different files, so a rename between them replaces one with the other.
+TEST(RenameTest, BetweenWhiteoutDevices) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_MKNOD)));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // An overlay does not allow whiteout devices.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(dir.path())));
+  const std::string a = JoinPath(dir.path(), "a");
+  const std::string b = JoinPath(dir.path(), "b");
+  if (mknod(a.c_str(), S_IFCHR, makedev(0, 0)) != 0) {
+    // Some filesystems, such as a gofer filesystem, do not allow device
+    // files.
+    ASSERT_EQ(errno, EPERM);
+    GTEST_SKIP() << "mknod is not allowed";
+  }
+  ASSERT_THAT(mknod(b.c_str(), S_IFCHR, makedev(0, 0)), SyscallSucceeds());
+  ASSERT_THAT(rename(a.c_str(), b.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Exists(a), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(Exists(b), IsPosixErrorOkAndHolds(true));
+}
+
+// Like Linux, a rename between links to the same file does nothing and
+// succeeds, even without write permission on the directory.
+TEST(RenameTest, LinksToSameFileInDirectoryNotWritable) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // gVisor's FUSE client sends a rename between links to the same file to the
+  // FUSE server.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  ASSERT_THAT(chmod(dir.path().c_str(), 0555), SyscallSucceeds());
+  auto restore_mode = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  // Drop capabilities that allow us to override directory permissions.
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  EXPECT_THAT(rename(file.path().c_str(), link_path.c_str()),
+              SyscallSucceeds());
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(link_path), IsPosixErrorOkAndHolds(true));
+}
+
+// Like Linux, a rename of a directory onto itself succeeds, even without write
+// permission on the parent directory.
+TEST(RenameTest, DirectoryOntoItselfInDirectoryNotWritable) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto subdir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0555), SyscallSucceeds());
+  auto restore_mode = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  // Drop capabilities that allow us to override directory permissions.
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  EXPECT_THAT(rename(subdir.path().c_str(), subdir.path().c_str()),
+              SyscallSucceeds());
+  EXPECT_THAT(Exists(subdir.path()), IsPosixErrorOkAndHolds(true));
+}
+
+// Like Linux, a rename between links to the same file in a sticky directory
+// succeeds for a user that does not own the file or the directory.
+TEST(RenameTest, LinksToSameFileInStickyDirectory) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // See LinksToSameFileInDirectoryNotWritable.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  ASSERT_THAT(chmod(dir.path().c_str(), 01777), SyscallSucceeds());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  // The user must be able to search the directories above dir.
+  struct stat st;
+  ASSERT_THAT(stat(GetAbsoluteTestTmpdir().c_str(), &st), SyscallSucceeds());
+  SKIP_IF((st.st_mode & S_IXOTH) == 0);
+
+  constexpr int kNobody = 65534;
+  const auto rest = [&] {
+    TEST_PCHECK(setresgid(kNobody, kNobody, kNobody) == 0);
+    TEST_PCHECK(setresuid(kNobody, kNobody, kNobody) == 0);
+    TEST_PCHECK(rename(file.path().c_str(), link_path.c_str()) == 0);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(link_path), IsPosixErrorOkAndHolds(true));
 }
 
 TEST(RenameTest, DirectoryOverwritesDirectoryLinkCount) {
@@ -500,6 +711,19 @@ TEST(Renameat2Test, NoReplaceExisting) {
               SyscallFailsWithErrno(AnyOf(ENOSYS, EINVAL, EEXIST)));
 }
 
+TEST(Renameat2Test, NoReplaceLinkToSameFile) {
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const std::string link_path = NewTempAbsPath();
+  ASSERT_THAT(link(f.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  auto link_cleanup = Cleanup([&] { unlink(link_path.c_str()); });
+  // renameat2 may fail with ENOSYS (if the syscall is unsupported), EINVAL (if
+  // flags are unsupported), or EEXIST (if RENAME_NOREPLACE is operating
+  // correctly).
+  EXPECT_THAT(renameat2(AT_FDCWD, f.path().c_str(), AT_FDCWD, link_path.c_str(),
+                        RENAME_NOREPLACE),
+              SyscallFailsWithErrno(AnyOf(ENOSYS, EINVAL, EEXIST)));
+}
+
 TEST(Renameat2Test, NoReplaceDot) {
   auto d1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   auto d2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
@@ -519,6 +743,127 @@ bool RenameExchangeSupported() {
     return false;
   }
   return absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) != "TRUE";
+}
+
+TEST(Renameat2Test, ExchangeLinksToSameFile) {
+  SKIP_IF(!RenameExchangeSupported());
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir.path(), "contents", TempPath::kDefaultFileMode));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  int inotify_fd;
+  ASSERT_THAT(inotify_fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor inotify(inotify_fd);
+  ASSERT_THAT(
+      inotify_add_watch(inotify.get(), dir.path().c_str(), IN_ALL_EVENTS),
+      SyscallSucceeds());
+
+  // An exchange between two links to the same file does nothing.
+  ASSERT_THAT(renameat2(AT_FDCWD, file.path().c_str(), AT_FDCWD,
+                        link_path.c_str(), RENAME_EXCHANGE),
+              SyscallSucceeds());
+  char event_buf[256];
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(GetContents(file.path()), IsPosixErrorOkAndHolds("contents"));
+  EXPECT_THAT(GetContents(link_path), IsPosixErrorOkAndHolds("contents"));
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(2));
+}
+
+// Like Linux, an exchange between links to the same file succeeds, even
+// without write permission on the directory.
+TEST(Renameat2Test, ExchangeLinksToSameFileInDirectoryNotWritable) {
+  SKIP_IF(!RenameExchangeSupported());
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // See RenameTest.LinksToSameFileInDirectoryNotWritable.
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  ASSERT_THAT(chmod(dir.path().c_str(), 0555), SyscallSucceeds());
+  auto restore_mode = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+
+  // Drop capabilities that allow us to override directory permissions.
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  EXPECT_THAT(renameat2(AT_FDCWD, file.path().c_str(), AT_FDCWD,
+                        link_path.c_str(), RENAME_EXCHANGE),
+              SyscallSucceeds());
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(link_path), IsPosixErrorOkAndHolds(true));
+}
+
+// A rename between links to the same file with a trailing slash on either
+// name fails with ENOTDIR, like other renames of files that are not
+// directories.
+TEST(RenameTest, LinksToSameFileWithTrailingSlash) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(rename(file.path().c_str(), (link_path + "/").c_str()),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_THAT(rename((file.path() + "/").c_str(), link_path.c_str()),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_THAT(rename(file.path().c_str(), (file.path() + "/").c_str()),
+              SyscallFailsWithErrno(ENOTDIR));
+  if (RenameExchangeSupported()) {
+    EXPECT_THAT(renameat2(AT_FDCWD, file.path().c_str(), AT_FDCWD,
+                          (link_path + "/").c_str(), RENAME_EXCHANGE),
+                SyscallFailsWithErrno(ENOTDIR));
+  }
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(2));
+  // A directory with a trailing slash can be renamed onto itself.
+  auto subdir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  EXPECT_THAT(rename(subdir.path().c_str(), (subdir.path() + "/").c_str()),
+              SyscallSucceeds());
+}
+
+// A rename onto a mount point, an exchange with one, and an unlink of one fail
+// with EBUSY.
+TEST(RenameTest, OntoMountPointFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto a = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  auto b = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dir.path()));
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  auto g = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  auto const mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", b.path(), "tmpfs", 0, "", 0));
+  auto const file_mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount(f.path(), g.path(), "", MS_BIND, "", 0));
+  EXPECT_THAT(rename(a.path().c_str(), b.path().c_str()),
+              SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(rename(f.path().c_str(), g.path().c_str()),
+              SyscallFailsWithErrno(EBUSY));
+  EXPECT_THAT(unlink(g.path().c_str()), SyscallFailsWithErrno(EBUSY));
+  if (RenameExchangeSupported()) {
+    EXPECT_THAT(renameat2(AT_FDCWD, a.path().c_str(), AT_FDCWD,
+                          b.path().c_str(), RENAME_EXCHANGE),
+                SyscallFailsWithErrno(EBUSY));
+  }
+}
+
+// Like Linux, a rename of a file onto itself and an exchange of a file with
+// itself succeed, even without write permission on the directory.
+TEST(RenameTest, FileOntoItselfInDirectoryNotWritable) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  ASSERT_THAT(chmod(dir.path().c_str(), 0555), SyscallSucceeds());
+  auto restore_mode = Cleanup(
+      [&] { EXPECT_THAT(chmod(dir.path().c_str(), 0755), SyscallSucceeds()); });
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  EXPECT_THAT(rename(file.path().c_str(), file.path().c_str()),
+              SyscallSucceeds());
+  if (RenameExchangeSupported()) {
+    EXPECT_THAT(renameat2(AT_FDCWD, file.path().c_str(), AT_FDCWD,
+                          file.path().c_str(), RENAME_EXCHANGE),
+                SyscallSucceeds());
+  }
+  EXPECT_THAT(Exists(file.path()), IsPosixErrorOkAndHolds(true));
 }
 
 TEST(Renameat2Test, ExchangeDirectories) {

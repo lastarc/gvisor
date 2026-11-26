@@ -1442,6 +1442,32 @@ func (fs *filesystem) ReadlinkAt(ctx context.Context, rp *vfs.ResolvingPath) (st
 	return d.readlink(ctx, rp.Mount())
 }
 
+// sameRemoteFile returns true if oldName in oldParent and newName in newParent
+// have the device and inode numbers key on the remote filesystem, and the same
+// link count, which is at least 2, as links to one file have. If
+// sameRemoteFile cannot find out, it returns false.
+func (fs *filesystem) sameRemoteFile(ctx context.Context, oldParent *dentry, oldName string, newParent *dentry, newName string, key inoKey) bool {
+	oldKey, oldNlink, ok, err := oldParent.inode.childFile(ctx, oldName)
+	if err != nil || !ok || oldKey != key {
+		return false
+	}
+	newKey, newNlink, ok, err := newParent.inode.childFile(ctx, newName)
+	return err == nil && ok && newKey == key && oldNlink >= 2 && oldNlink == newNlink
+}
+
+// renameDidNothing returns true if a rename or exchange of oldName in oldParent
+// and newName in newParent, which had the device and inode numbers key on the
+// remote filesystem before the rename, did nothing there. If renameDidNothing
+// cannot find out, it returns false.
+func (fs *filesystem) renameDidNothing(ctx context.Context, oldParent *dentry, oldName string, newParent *dentry, newName string, key inoKey, exchange bool) bool {
+	if exchange {
+		return fs.sameRemoteFile(ctx, oldParent, oldName, newParent, newName, key)
+	}
+	// A rename that does something removes oldName.
+	oldKey, _, ok, err := oldParent.inode.childFile(ctx, oldName)
+	return err == nil && ok && oldKey == key
+}
+
 // RenameAt implements vfs.FilesystemImpl.RenameAt.
 func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldParentVD vfs.VirtualDentry, oldName string, opts vfs.RenameOptions) error {
 	// Resolve newParent first to verify that it's on this Mount.
@@ -1505,7 +1531,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		}
 	}
 	creds := rp.Credentials()
-	if err := oldParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+	if err := oldParent.checkPermissions(creds, vfs.MayExec); err != nil {
 		return err
 	}
 
@@ -1525,6 +1551,37 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	if err != nil {
 		return err
 	}
+	// A rename or exchange onto the same name, or between links to the same
+	// file, does nothing. Like Linux, check this before the write permission
+	// checks.
+	if oldParent == newParent && oldName == newName && opts.Flags&linux.RENAME_NOREPLACE == 0 && (renamed.isDir() || (!opts.MustBeDir && !rp.MustBeDir())) {
+		return nil
+	}
+	if oldParent != newParent {
+		if err := newParent.checkPermissions(creds, vfs.MayExec); err != nil {
+			return err
+		}
+		newParent.opMu.Lock()
+		defer newParent.opMu.Unlock()
+	}
+	if oldParent.isDeleted() || newParent.isDeleted() {
+		return linuxerr.ENOENT
+	}
+	replaced, err := fs.getChildLocked(ctx, newParent, newName, &ds) // +checklocksforce: newParent.opMu taken if newParent != oldParent.
+	if err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
+		return err
+	}
+	if replaced != nil && opts.Flags&linux.RENAME_NOREPLACE == 0 && !renamed.isDir() && !opts.MustBeDir && !rp.MustBeDir() &&
+		!renamed.inode.isSynthetic() && !replaced.inode.isSynthetic() && replaced.inode.inoKey == renamed.inode.inoKey &&
+		fs.sameRemoteFile(ctx, oldParent, oldName, newParent, newName, renamed.inode.inoKey) {
+		// Do not send the rename to the remote filesystem, which can update
+		// its own state as if the rename removed oldName.
+		return nil
+	}
+
+	if err := oldParent.checkPermissions(creds, vfs.MayWrite); err != nil {
+		return err
+	}
 	if err := oldParent.mayDelete(creds, renamed); err != nil {
 		return err
 	}
@@ -1542,20 +1599,10 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			return linuxerr.ENOTDIR
 		}
 	}
-
 	if oldParent != newParent {
-		if err := newParent.checkPermissions(creds, vfs.MayWrite|vfs.MayExec); err != nil {
+		if err := newParent.checkPermissions(creds, vfs.MayWrite); err != nil {
 			return err
 		}
-		newParent.opMu.Lock()
-		defer newParent.opMu.Unlock()
-	}
-	if oldParent.isDeleted() || newParent.isDeleted() {
-		return linuxerr.ENOENT
-	}
-	replaced, err := fs.getChildLocked(ctx, newParent, newName, &ds) // +checklocksforce: newParent.opMu taken if newParent != oldParent.
-	if err != nil && !linuxerr.Equals(linuxerr.ENOENT, err) {
-		return err
 	}
 	var replacedVFSD *vfs.Dentry
 	if replaced != nil {
@@ -1619,6 +1666,13 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if err := oldParent.inode.rename(ctx, oldName, newParent, newName, opts.Flags); err != nil {
 			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 			return err
+		}
+		// A rename or exchange between links to the same file does nothing.
+		// The names can have changed on the remote filesystem since
+		// sameRemoteFile, so ask the remote filesystem again.
+		if replaced != nil && replaced.inode.inoKey == renamed.inode.inoKey && fs.renameDidNothing(ctx, oldParent, oldName, newParent, newName, renamed.inode.inoKey, exchange) {
+			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
+			return nil
 		}
 	} else if replaced != nil && !replaced.inode.isSynthetic() && !exchange {
 		// We are replacing an existing real file with a synthetic one, so we

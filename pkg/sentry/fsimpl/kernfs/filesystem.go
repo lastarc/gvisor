@@ -896,11 +896,13 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		if dst == nil {
 			panic(fmt.Sprintf("Child %q for parent Dentry %+v disappeared inside atomic section?", newName, dstDir))
 		}
+		// A rename onto the same name, or between links to the same inode,
+		// does nothing. With NoNegativeDentries, like Linux, check this
+		// before the delete and write permission checks.
+		if src.inode == dst.inode {
+			return nil
+		}
 		if fs.NoNegativeDentries {
-			// vfs_rename succeeds for the same inode before may_delete.
-			if src.inode == dst.inode {
-				return nil
-			}
 			if err := checkDeleteLocked(ctx, rp, src); err != nil {
 				return err
 			}

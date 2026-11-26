@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fsutil"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
@@ -502,6 +503,33 @@ func (i *inode) rename(ctx context.Context, oldName string, newParent *dentry, n
 		return it.controlFD.RenameAt(ctx, oldName, newParent.inode.impl.(*lisafsInode).controlFD.ID(), newName, flags)
 	case *directfsInode:
 		return fsutil.RenameAt2(it.controlFD, oldName, newParent.inode.impl.(*directfsInode).controlFD, newName, flags)
+	default:
+		panic("unknown inode implementation")
+	}
+}
+
+// childFile returns the device and inode numbers and the link count of the
+// child named name of i, a directory, on the remote filesystem. ok is false if
+// the child does not exist.
+//
+// Precondition: !i.isSynthetic().
+func (i *inode) childFile(ctx context.Context, name string) (key inoKey, nlink uint32, ok bool, err error) {
+	switch it := i.impl.(type) {
+	case *lisafsInode:
+		stats, err := it.controlFD.WalkStat(ctx, []string{name})
+		if err != nil || len(stats) == 0 {
+			return inoKey{}, 0, false, err
+		}
+		return inoKeyFromStatx(&stats[0]), stats[0].Nlink, true, nil
+	case *directfsInode:
+		stat, err := fsutil.StatAt(it.controlFD, name)
+		if linuxerr.Equals(linuxerr.ENOENT, err) {
+			return inoKey{}, 0, false, nil
+		}
+		if err != nil {
+			return inoKey{}, 0, false, err
+		}
+		return inoKeyFromStat(&stat), uint32(stat.Nlink), true, nil
 	default:
 		panic("unknown inode implementation")
 	}
