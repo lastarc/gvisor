@@ -171,6 +171,13 @@ type BridgeEndpoint struct {
 	attached bool
 	// +checklocks:mu
 	mtu uint32
+	// mtuSetByUser is true if SetMTU set mtu. If mtuSetByUser is false, mtu
+	// is the MTU given to NewBridgeEndpoint until a port is added or removed,
+	// and then the smallest MTU of the ports, or bridgeDefaultMTU if the
+	// bridge has no ports.
+	//
+	// +checklocks:mu
+	mtuSetByUser bool
 	// +checklocks:mu
 	fdbTable        map[BridgeFDBKey]BridgeFDBEntry
 	maxHeaderLength atomicbitops.Uint32
@@ -218,8 +225,42 @@ func (b *BridgeEndpoint) AddNIC(n *nic) tcpip.Error {
 	if b.maxHeaderLength.Load() < uint32(n.MaxHeaderLength()) {
 		b.maxHeaderLength.Store(uint32(n.MaxHeaderLength()))
 	}
+	b.adjustMTULocked()
 
 	return nil
+}
+
+// NICMTUChanged updates the bridge after the MTU of the specified NIC
+// changed.
+func (b *BridgeEndpoint) NICMTUChanged(n *nic) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.ports[n.id]; ok {
+		b.adjustMTULocked()
+	}
+}
+
+// bridgeDefaultMTU is the MTU of a bridge without ports, Linux's ETH_DATA_LEN.
+const bridgeDefaultMTU = 1500
+
+// adjustMTULocked sets the MTU of the bridge to the smallest MTU of its ports,
+// unless SetMTU set the MTU.
+//
+// +checklocks:b.mu
+func (b *BridgeEndpoint) adjustMTULocked() {
+	if b.mtuSetByUser {
+		return
+	}
+	mtu := uint32(0)
+	for _, p := range b.ports {
+		if portMTU := p.nic.NetworkLinkEndpoint.MTU(); mtu == 0 || portMTU < mtu {
+			mtu = portMTU
+		}
+	}
+	if mtu == 0 {
+		mtu = bridgeDefaultMTU
+	}
+	b.mtu = mtu
 }
 
 // NICAddressChanged updates the bridge after the link address of the
@@ -266,6 +307,7 @@ func (b *BridgeEndpoint) DelNIC(nic *nic) tcpip.Error {
 	}
 	delete(b.ports, nic.id)
 	nic.NetworkLinkEndpoint.Attach(nic)
+	b.adjustMTULocked()
 	return nil
 }
 
@@ -281,6 +323,7 @@ func (b *BridgeEndpoint) SetMTU(mtu uint32) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.mtu = mtu
+	b.mtuSetByUser = true
 }
 
 // MaxHeaderLength implements stack.LinkEndpoint.
@@ -313,6 +356,8 @@ func (b *BridgeEndpoint) Attach(dispatcher NetworkDispatcher) {
 	defer b.mu.Unlock()
 	for _, p := range b.ports {
 		p.nic.Primary = nil
+		// Give the packets of the port to its own NIC again.
+		p.nic.NetworkLinkEndpoint.Attach(p.nic)
 	}
 	b.dispatcher = dispatcher
 	b.ports = make(map[tcpip.NICID]*bridgePort)

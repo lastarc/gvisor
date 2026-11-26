@@ -444,13 +444,33 @@ func (s *Stack) setLinkLocked(ctx context.Context, id tcpip.NICID, linkAttrs map
 		if !ok {
 			return syserr.ErrInvalidArgument
 		}
-		if master != 0 {
-			if mid, ok := src.Stack.GetNICCoordinatorID(id); !ok || mid != tcpip.NICID(master) {
-				if err := src.Stack.SetNICCoordinator(id, tcpip.NICID(master)); err != nil {
+		mid, hasMaster := src.Stack.GetNICCoordinatorID(id)
+		switch {
+		case master == 0 && hasMaster:
+			// A master of 0 releases the device from its master.
+			if err := src.Stack.RemoveNICCoordinator(id); err != nil {
+				return syserr.TranslateNetstackError(err)
+			}
+			changed = true
+		case master != 0 && (!hasMaster || mid != tcpip.NICID(master)):
+			if hasMaster {
+				// Release the device from its current master first.
+				if err := src.Stack.RemoveNICCoordinator(id); err != nil {
 					return syserr.TranslateNetstackError(err)
 				}
 				changed = true
 			}
+			if err := src.Stack.SetNICCoordinator(id, tcpip.NICID(master)); err != nil {
+				if changed {
+					src.sendChangeEvent(ctx, id)
+				}
+				if _, ok := err.(*tcpip.ErrUnknownNICID); ok {
+					// Like Linux, a master that does not exist is not valid.
+					return syserr.ErrInvalidArgument
+				}
+				return syserr.TranslateNetstackError(err)
+			}
+			changed = true
 		}
 	}
 
@@ -736,6 +756,8 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		Name:      ifname,
 		Kind:      "veth",
 		Multicast: true,
+		MinMTU:    header.IPv4MinimumMTU,
+		MaxMTU:    ethMaxMTU,
 	})
 	if err != nil {
 		s.unlockSrcAndDst(ctx, dstNs)
@@ -764,10 +786,19 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 		Name:      peerName,
 		Kind:      "veth",
 		Multicast: true,
+		MinMTU:    header.IPv4MinimumMTU,
+		MaxMTU:    ethMaxMTU,
 	})
 	if err != nil {
 		peerEP.Close()
 		return syserr.TranslateNetstackError(err)
+	}
+	if peerLinkAttrs == nil {
+		// Like Linux, without peer attributes the peer gets the MTU of the
+		// device.
+		if v, ok := linkAttrs[linux.IFLA_MTU]; ok {
+			peerLinkAttrs = map[uint16]nlmsg.BytesView{linux.IFLA_MTU: v}
+		}
 	}
 	if peerLinkAttrs != nil {
 		if err := peerStack.setLinkLocked(ctx, peerID, peerLinkAttrs, 0 /* flags */, 0 /* change */, peerDstNs); err != nil {
@@ -779,6 +810,10 @@ func (s *Stack) newVeth(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesVie
 
 	return nil
 }
+
+// ethMaxMTU is Linux's ETH_MAX_MTU. Like Linux, veth and bridge devices accept
+// MTUs from header.IPv4MinimumMTU to ethMaxMTU.
+const ethMaxMTU = 65535
 
 func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesView, linkInfoAttrs map[uint16]nlmsg.BytesView) *syserr.Error {
 	dstNs, sysErr := s.lockSrcAndDst(ctx, linkAttrs)
@@ -795,13 +830,30 @@ func (s *Stack) newBridge(ctx context.Context, linkAttrs map[uint16]nlmsg.BytesV
 	if ifname == "" {
 		ifname = s.allocDeviceName("bridge", dstNs)
 	}
-	ep := stack.NewBridgeEndpoint(defaultMTU)
+	// Like Linux, an MTU set at creation does not stop the bridge MTU from
+	// following the MTUs of the ports.
+	mtu := uint32(defaultMTU)
+	if v, ok := linkAttrs[linux.IFLA_MTU]; ok {
+		if mtu, ok = v.Uint32(); !ok || mtu < header.IPv4MinimumMTU || mtu > ethMaxMTU {
+			return syserr.ErrInvalidArgument
+		}
+		attrs := make(map[uint16]nlmsg.BytesView, len(linkAttrs)-1)
+		for k, v := range linkAttrs {
+			if k != linux.IFLA_MTU {
+				attrs[k] = v
+			}
+		}
+		linkAttrs = attrs
+	}
+	ep := stack.NewBridgeEndpoint(mtu)
 	id := s.Stack.NextNICID()
 	// Linux's br_dev_setup also inherits IFF_MULTICAST from ether_setup.
 	err := s.Stack.CreateNICWithOptions(id, ep, stack.NICOptions{
 		Name:      ifname,
 		Kind:      "bridge",
 		Multicast: true,
+		MinMTU:    header.IPv4MinimumMTU,
+		MaxMTU:    ethMaxMTU,
 	})
 	if err != nil {
 		return syserr.TranslateNetstackError(err)

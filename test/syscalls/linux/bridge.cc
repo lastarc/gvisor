@@ -51,6 +51,7 @@
 #include "absl/time/time.h"
 #include "test/syscalls/linux/socket_netlink_route_util.h"
 #include "test/syscalls/linux/socket_netlink_util.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
@@ -103,15 +104,19 @@ void EndNest(LinkRequest* req, struct rtattr* nest) {
 }
 
 // Creates a link of the given kind. If peer is not null, the link is a veth
-// pair and peer names the other end.
+// pair and peer names the other end. If mtu is not 0, the link is created with
+// that MTU.
 PosixError NewLink(const FileDescriptor& fd, uint32_t seq, const char* kind,
-                   const char* name, const char* peer) {
+                   const char* name, const char* peer, uint32_t mtu = 0) {
   LinkRequest req = {};
   req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
   req.hdr.nlmsg_type = RTM_NEWLINK;
   req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
   req.hdr.nlmsg_seq = seq;
   AddAttr(&req, IFLA_IFNAME, name, strlen(name));
+  if (mtu != 0) {
+    AddAttr(&req, IFLA_MTU, &mtu, sizeof(mtu));
+  }
   struct rtattr* linkinfo = AddAttr(&req, IFLA_LINKINFO, nullptr, 0);
   AddAttr(&req, IFLA_INFO_KIND, kind, strlen(kind));
   if (peer != nullptr) {
@@ -138,6 +143,14 @@ PosixError SetLinkAttr(const FileDescriptor& fd, uint32_t seq, int index,
   req.ifm.ifi_index = index;
   AddAttr(&req, type, data, len);
   return NetlinkRequestAckOrError(fd, seq, &req, req.hdr.nlmsg_len);
+}
+
+PosixErrorOr<int> MTU(const char* name) {
+  ASSIGN_OR_RETURN_ERRNO(FileDescriptor s, Socket(AF_INET, SOCK_DGRAM, 0));
+  struct ifreq ifr = {};
+  strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
+  RETURN_ERROR_IF_SYSCALL_FAIL(ioctl(s.get(), SIOCGIFMTU, &ifr));
+  return ifr.ifr_mtu;
 }
 
 PosixErrorOr<MacAddress> HardwareAddress(const char* name) {
@@ -470,6 +483,344 @@ TEST_F(BridgeLocalDeliveryTest, PortAddressChangeIsTracked) {
   ASSERT_NO_FATAL_FAILURE(Deliver(port_b_mac_, &delivered, &forwarded));
   EXPECT_FALSE(delivered) << "old other-port address";
   EXPECT_TRUE(forwarded) << "old other-port address";
+}
+
+// LinkMTUTest runs each test in a new network namespace.
+class LinkMTUTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_ADMIN)));
+    SKIP_IF(IsRunningWithHostinet());
+    ASSERT_THAT(unshare(CLONE_NEWNET), SyscallSucceeds());
+    nl_ = ASSERT_NO_ERRNO_AND_VALUE(NetlinkBoundSocket(NETLINK_ROUTE));
+  }
+
+  // NewBridge creates a bridge. It skips the test if Linux does not support
+  // bridges.
+  void NewBridge(const char* name, uint32_t mtu = 0) {
+    PosixError err = NewLink(nl_, seq_++, "bridge", name, nullptr, mtu);
+    if (!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP) {
+      GTEST_SKIP() << "bridges are not supported";
+    }
+    ASSERT_NO_ERRNO(err);
+  }
+
+  PosixError SetMTU(int index, uint32_t mtu) {
+    return SetLinkAttr(nl_, seq_++, index, IFLA_MTU, &mtu, sizeof(mtu));
+  }
+
+  PosixError SetMaster(int index, int master) {
+    return SetLinkAttr(nl_, seq_++, index, IFLA_MASTER, &master,
+                       sizeof(master));
+  }
+
+  FileDescriptor nl_;
+  uint32_t seq_ = kSeq + 100;
+};
+
+// The ends of a veth pair have separate MTUs.
+TEST_F(LinkMTUTest, VethEndsHaveSeparateMTUs) {
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "va", "vb"));
+  const int va = if_nametoindex("va");
+  ASSERT_NE(va, 0);
+  ASSERT_NO_ERRNO(SetMTU(va, 1400));
+  EXPECT_THAT(MTU("va"), IsPosixErrorOkAndHolds(1400));
+  EXPECT_THAT(MTU("vb"), IsPosixErrorOkAndHolds(1500));
+}
+
+// A veth pair created without peer attributes gives its MTU to both ends.
+TEST_F(LinkMTUTest, VethWithoutPeerAttributesGivesMTUToPeer) {
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "va", nullptr, 9000));
+  EXPECT_THAT(MTU("va"), IsPosixErrorOkAndHolds(9000));
+  // The new network namespace has only lo and the two ends.
+  struct if_nameindex* names = if_nameindex();
+  ASSERT_NE(names, nullptr);
+  auto free_names = Cleanup([names] { if_freenameindex(names); });
+  int peers = 0;
+  for (struct if_nameindex* n = names; n->if_index != 0; n++) {
+    const std::string name = n->if_name;
+    if (name == "lo" || name == "va") {
+      continue;
+    }
+    peers++;
+    EXPECT_THAT(MTU(name.c_str()), IsPosixErrorOkAndHolds(9000)) << name;
+  }
+  EXPECT_EQ(peers, 1);
+}
+
+// Veth and bridge devices accept MTUs from 68 to 65535.
+TEST_F(LinkMTUTest, MTULimits) {
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "va", "vb"));
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  for (const char* name : {"va", "br0"}) {
+    SCOPED_TRACE(name);
+    const int index = if_nametoindex(name);
+    ASSERT_NE(index, 0);
+    for (uint32_t mtu : {67u, 65536u}) {
+      EXPECT_THAT(SetMTU(index, mtu), PosixErrorIs(EINVAL, ::testing::_))
+          << mtu;
+    }
+    for (uint32_t mtu : {68u, 65535u}) {
+      EXPECT_NO_ERRNO(SetMTU(index, mtu)) << mtu;
+      EXPECT_THAT(MTU(name), IsPosixErrorOkAndHolds(static_cast<int>(mtu)));
+    }
+  }
+}
+
+// The MTU of a bridge is the smallest MTU of its ports, or 1500 if it has no
+// ports, until the MTU of the bridge is set. An MTU given when the bridge is
+// created does not change this.
+TEST_F(LinkMTUTest, BridgeMTUFollowsPorts) {
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0", 1450));
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br1"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  const int br0 = if_nametoindex("br0");
+  ASSERT_NE(br0, 0);
+  const int br1 = if_nametoindex("br1");
+  ASSERT_NE(br1, 0);
+  const int pa = if_nametoindex("pa");
+  ASSERT_NE(pa, 0);
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1450));
+
+  ASSERT_NO_ERRNO(SetMTU(pa, 1400));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+  ASSERT_NO_ERRNO(SetMTU(pa, 1300));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1300));
+
+  // A new master releases the port from its old master.
+  ASSERT_NO_ERRNO(SetMaster(pa, br1));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1500));
+  EXPECT_THAT(MTU("br1"), IsPosixErrorOkAndHolds(1300));
+
+  // A master of 0 releases the port.
+  ASSERT_NO_ERRNO(SetMaster(pa, 0));
+  EXPECT_THAT(MTU("br1"), IsPosixErrorOkAndHolds(1500));
+  EXPECT_NO_ERRNO(SetMaster(pa, 0));
+
+  // An MTU set on the bridge stays.
+  ASSERT_NO_ERRNO(SetMTU(br0, 1450));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1450));
+}
+
+// An MTU given when a bridge is created must be from 68 to 65535.
+TEST_F(LinkMTUTest, NewBridgeMTULimits) {
+  for (uint32_t mtu : {67u, 65536u}) {
+    PosixError err = NewLink(nl_, seq_++, "bridge", "br0", nullptr, mtu);
+    if (!IsRunningOnGvisor() && err.errno_value() == EOPNOTSUPP) {
+      GTEST_SKIP() << "bridges are not supported";
+    }
+    EXPECT_THAT(err, PosixErrorIs(EINVAL, ::testing::_)) << mtu;
+    EXPECT_EQ(if_nametoindex("br0"), 0u) << mtu;
+  }
+}
+
+// The MTU of a bridge also rises when the smallest MTU of its ports rises, and
+// follows the ports that stay after a port device is deleted.
+TEST_F(LinkMTUTest, BridgeMTUFollowsSmallestPort) {
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pb", "ob"));
+  const int br0 = if_nametoindex("br0");
+  const int pa = if_nametoindex("pa");
+  const int pb = if_nametoindex("pb");
+  ASSERT_NE(br0, 0);
+  ASSERT_NE(pa, 0);
+  ASSERT_NE(pb, 0);
+  ASSERT_NO_ERRNO(SetMTU(pa, 1400));
+  ASSERT_NO_ERRNO(SetMTU(pb, 1300));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  ASSERT_NO_ERRNO(SetMaster(pb, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1300));
+  ASSERT_NO_ERRNO(SetMTU(pb, 9000));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+  ASSERT_NO_ERRNO(SetMTU(pb, 1200));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1200));
+
+  // Deleting a port device releases it from the bridge.
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_DELLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = seq_++;
+  req.ifm.ifi_index = pb;
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(nl_, req.hdr.nlmsg_seq, &req,
+                                           req.hdr.nlmsg_len));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+}
+
+// An MTU given when a veth device is created applies to that end only.
+TEST_F(LinkMTUTest, NewVethMTU) {
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "va", "vb", 1400));
+  EXPECT_THAT(MTU("va"), IsPosixErrorOkAndHolds(1400));
+  EXPECT_THAT(MTU("vb"), IsPosixErrorOkAndHolds(1500));
+}
+
+// An MTU set on a bridge without ports stays when ports with other MTUs are
+// added, even if it is larger than their MTUs.
+TEST_F(LinkMTUTest, BridgeMTUSetBeforePorts) {
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  const int br0 = if_nametoindex("br0");
+  const int pa = if_nametoindex("pa");
+  ASSERT_NO_ERRNO(SetMTU(br0, 9000));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(9000));
+  ASSERT_NO_ERRNO(SetMaster(pa, 0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(9000));
+}
+
+// A failed change of master releases the port from its old master first,
+// as on Linux.
+TEST_F(LinkMTUTest, FailedNewMasterReleasesPort) {
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  const int br0 = if_nametoindex("br0");
+  const int pa = if_nametoindex("pa");
+  const int oa = if_nametoindex("oa");
+  ASSERT_NE(br0, 0);
+  ASSERT_NE(pa, 0);
+  ASSERT_NE(oa, 0);
+  ASSERT_NO_ERRNO(SetMTU(pa, 1400));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+  // The same master again does nothing.
+  EXPECT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+  // A master that is not a bridge.
+  EXPECT_THAT(SetMaster(pa, oa), PosixErrorIs(EOPNOTSUPP, ::testing::_));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1500));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  // A master that does not exist.
+  EXPECT_THAT(SetMaster(pa, 12345), PosixErrorIs(EINVAL, ::testing::_));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1500));
+}
+
+// An MTU set on a bridge to its current MTU does not stop the bridge MTU
+// from following the ports, as on Linux.
+TEST_F(LinkMTUTest, BridgeMTUSetToSameValue) {
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  const int br0 = if_nametoindex("br0");
+  const int pa = if_nametoindex("pa");
+  ASSERT_NE(br0, 0);
+  ASSERT_NE(pa, 0);
+  ASSERT_NO_ERRNO(SetMTU(br0, 1500));
+  ASSERT_NO_ERRNO(SetMTU(pa, 1400));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  EXPECT_THAT(MTU("br0"), IsPosixErrorOkAndHolds(1400));
+}
+
+// Returns true if a UDP datagram for kBridgeIP:kPort that is sent from peer
+// to port reaches a UDP socket.
+bool PortReceives(const char* port, const char* peer) {
+  FileDescriptor udp = TEST_CHECK_NO_ERRNO_AND_VALUE(
+      Socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0));
+  struct sockaddr_in bind_addr = {};
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_port = htons(kPort);
+  TEST_PCHECK(bind(udp.get(), reinterpret_cast<sockaddr*>(&bind_addr),
+                   sizeof(bind_addr)) == 0);
+  FileDescriptor sender =
+      TEST_CHECK_NO_ERRNO_AND_VALUE(Socket(AF_PACKET, SOCK_RAW, 0));
+  const MacAddress dst = TEST_CHECK_NO_ERRNO_AND_VALUE(HardwareAddress(port));
+  const MacAddress src = TEST_CHECK_NO_ERRNO_AND_VALUE(HardwareAddress(peer));
+  const std::string payload = "port";
+  std::string frame(kPayloadOffset + payload.size(), '\0');
+  struct ethhdr eth = {};
+  memcpy(eth.h_dest, dst.data(), ETH_ALEN);
+  memcpy(eth.h_source, src.data(), ETH_ALEN);
+  eth.h_proto = htons(ETH_P_IP);
+  struct iphdr ip = {};
+  ip.version = 4;
+  ip.ihl = 5;
+  ip.tot_len = htons(frame.size() - sizeof(eth));
+  ip.ttl = 64;
+  ip.protocol = IPPROTO_UDP;
+  inet_pton(AF_INET, kPeerIP, &ip.saddr);
+  inet_pton(AF_INET, kBridgeIP, &ip.daddr);
+  ip.check = IPChecksum(ip);
+  struct udphdr udph = {};
+  udph.source = htons(kPort);
+  udph.dest = htons(kPort);
+  udph.len = htons(sizeof(udph) + payload.size());
+  memcpy(&frame[0], &eth, sizeof(eth));
+  memcpy(&frame[sizeof(eth)], &ip, sizeof(ip));
+  memcpy(&frame[sizeof(eth) + sizeof(ip)], &udph, sizeof(udph));
+  memcpy(&frame[kPayloadOffset], payload.data(), payload.size());
+  struct sockaddr_ll ll = {};
+  ll.sll_family = AF_PACKET;
+  ll.sll_protocol = htons(ETH_P_IP);
+  ll.sll_ifindex = if_nametoindex(peer);
+  ll.sll_halen = ETH_ALEN;
+  memcpy(ll.sll_addr, dst.data(), ETH_ALEN);
+  for (int i = 0; i < 20; i++) {
+    TEST_PCHECK(sendto(sender.get(), frame.data(), frame.size(), 0,
+                       reinterpret_cast<sockaddr*>(&ll),
+                       sizeof(ll)) == static_cast<ssize_t>(frame.size()));
+    absl::SleepFor(absl::Milliseconds(100));
+    char buf[64];
+    if (recv(udp.get(), buf, sizeof(buf), 0) > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Deleting a bridge releases its ports, and the ports keep working, as on
+// Linux.
+TEST_F(LinkMTUTest, DeleteBridgeWithPorts) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_NET_RAW)));
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br0"));
+  ASSERT_NO_FATAL_FAILURE(NewBridge("br1"));
+  ASSERT_NO_ERRNO(NewLink(nl_, seq_++, "veth", "pa", "oa"));
+  const int br0 = if_nametoindex("br0");
+  const int br1 = if_nametoindex("br1");
+  const int pa = if_nametoindex("pa");
+  const int oa = if_nametoindex("oa");
+  ASSERT_NE(br0, 0);
+  ASSERT_NE(br1, 0);
+  ASSERT_NE(pa, 0);
+  ASSERT_NE(oa, 0);
+  for (int index : {pa, oa, br0}) {
+    ASSERT_NO_ERRNO(LinkChangeFlags(index, IFF_UP, IFF_UP));
+  }
+  struct in_addr addr;
+  ASSERT_EQ(inet_pton(AF_INET, kBridgeIP, &addr), 1);
+  ASSERT_NO_ERRNO(LinkAddLocalAddr(nl_, pa, AF_INET, 24, &addr, sizeof(addr)));
+  ASSERT_TRUE(PortReceives("pa", "oa"));
+  ASSERT_NO_ERRNO(SetMaster(pa, br0));
+  LinkRequest req = {};
+  req.hdr.nlmsg_len = NLMSG_LENGTH(sizeof(req.ifm));
+  req.hdr.nlmsg_type = RTM_DELLINK;
+  req.hdr.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+  req.hdr.nlmsg_seq = seq_++;
+  req.ifm.ifi_index = br0;
+  ASSERT_NO_ERRNO(NetlinkRequestAckOrError(nl_, req.hdr.nlmsg_seq, &req,
+                                           req.hdr.nlmsg_len));
+  EXPECT_TRUE(PortReceives("pa", "oa"));
+  EXPECT_NO_ERRNO(SetMTU(pa, 1300));
+  EXPECT_NO_ERRNO(SetMaster(pa, 0));
+  EXPECT_TRUE(PortReceives("pa", "oa"));
+  EXPECT_NO_ERRNO(SetMaster(pa, br1));
+  EXPECT_THAT(MTU("br1"), IsPosixErrorOkAndHolds(1300));
+}
+
+// A veth pair cannot be created with an MTU that is not valid, and creation
+// that fails leaves no device.
+TEST_F(LinkMTUTest, NewVethMTULimits) {
+  for (uint32_t mtu : {67u, 65536u}) {
+    EXPECT_THAT(NewLink(nl_, seq_++, "veth", "va", "vb", mtu),
+                PosixErrorIs(EINVAL, ::testing::_))
+        << mtu;
+    EXPECT_EQ(if_nametoindex("va"), 0u) << mtu;
+    EXPECT_EQ(if_nametoindex("vb"), 0u) << mtu;
+    EXPECT_THAT(NewLink(nl_, seq_++, "veth", "va", nullptr, mtu),
+                PosixErrorIs(EINVAL, ::testing::_))
+        << mtu;
+    EXPECT_EQ(if_nametoindex("va"), 0u) << mtu;
+  }
 }
 
 }  // namespace

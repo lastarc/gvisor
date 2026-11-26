@@ -16,6 +16,7 @@
 package veth
 
 import (
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -36,6 +37,9 @@ type veth struct {
 
 	backlogQueue chan vethPacket `state:"nosave"`
 
+	// mtu is the MTU that SetMTU set last on either endpoint, or the initial
+	// MTU. An endpoint uses mtu if its own MTU is 0.
+	//
 	// +checklocks:mu
 	mtu uint32
 
@@ -92,6 +96,9 @@ type Endpoint struct {
 	//
 	// +checklocks:mu
 	linkAddr tcpip.LinkAddress
+	// mtu is the MTU of this endpoint. If mtu is 0, the MTU is veth.mtu. Like
+	// Linux, the endpoints of a pair have separate MTUs.
+	mtu atomicbitops.Uint32
 	// +checklocks:mu
 	onCloseAction func() `state:"nosave"`
 }
@@ -104,9 +111,11 @@ func NewPair(mtu, backlogQueueSize uint32) (*Endpoint, *Endpoint) {
 		endpoints: [2]Endpoint{
 			{
 				linkAddr: tcpip.GetRandMacAddr(),
+				mtu:      atomicbitops.FromUint32(mtu),
 			},
 			{
 				linkAddr: tcpip.GetRandMacAddr(),
+				mtu:      atomicbitops.FromUint32(mtu),
 			},
 		},
 	}
@@ -169,20 +178,20 @@ func (e *Endpoint) IsAttached() bool {
 }
 
 // MTU implements stack.LinkEndpoint.MTU.
-//
-// +checklocksexclude:e.veth.mu
 func (e *Endpoint) MTU() uint32 {
+	if mtu := e.mtu.Load(); mtu != 0 {
+		return mtu
+	}
 	e.veth.mu.RLock()
 	defer e.veth.mu.RUnlock()
 	return e.veth.mtu
 }
 
 // SetMTU implements stack.LinkEndpoint.SetMTU.
-//
-// +checklocksexclude:e.veth.mu
 func (e *Endpoint) SetMTU(mtu uint32) {
 	e.veth.mu.Lock()
 	defer e.veth.mu.Unlock()
+	e.mtu.Store(mtu)
 	e.veth.mtu = mtu
 }
 

@@ -1275,4 +1275,7 @@ type CoordinatorNIC interface {
 	// NICAddressChanged is called after the link address of the specified
 	// NIC device changed.
 	NICAddressChanged(n *nic)
+	// NICMTUChanged is called after the MTU of the specified NIC device
+	// changed.
+	NICMTUChanged(n *nic)
 }

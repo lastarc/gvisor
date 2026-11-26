@@ -1289,6 +1289,26 @@ func (s *Stack) GetNICCoordinatorID(id tcpip.NICID) (tcpip.NICID, bool) {
 	return 0, false
 }
 
+// RemoveNICCoordinator removes a NIC from its coordinator device, if it has
+// one.
+func (s *Stack) RemoveNICCoordinator(id tcpip.NICID) tcpip.Error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nic, ok := s.nics[id]
+	if !ok {
+		return &tcpip.ErrUnknownNICID{}
+	}
+	if nic.Primary == nil {
+		return nil
+	}
+	if err := nic.Primary.NetworkLinkEndpoint.(CoordinatorNIC).DelNIC(nic); err != nil {
+		return err
+	}
+	nic.Primary = nil
+	return nil
+}
+
 // SetNICCoordinator sets a coordinator device.
 func (s *Stack) SetNICCoordinator(id tcpip.NICID, mid tcpip.NICID) tcpip.Error {
 	s.mu.Lock()
@@ -1359,6 +1379,9 @@ func (s *Stack) SetNICMTU(id tcpip.NICID, mtu uint32) tcpip.Error {
 		return &tcpip.ErrInvalidOptionValue{}
 	}
 	nic.NetworkLinkEndpoint.SetMTU(mtu)
+	if nic.Primary != nil {
+		nic.Primary.NetworkLinkEndpoint.(CoordinatorNIC).NICMTUChanged(nic)
+	}
 	return nil
 }
 
