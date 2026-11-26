@@ -1755,6 +1755,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	if replaced != nil {
 		replaced.setDeleted()
+		if !replaced.isDir() {
+			replaced.decLinks()
+		}
 		// If an extra reference is held on replaced as described by the
 		// comment for dentry.refs, drop that reference now. We can't race with
 		// fs.unlinkAt() or invalidation since fs.renameMu has been locked for

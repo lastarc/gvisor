@@ -89,6 +89,20 @@ TEST(LinkTest, CanCreateLinkFile) {
               IsPosixErrorOkAndHolds(initial_link_count));
 }
 
+// A file has no links after all of its links are unlinked.
+TEST(LinkTest, NoLinksAfterUnlinkingAllLinks) {
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const std::string link_path = NewTempAbsPath();
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_RDONLY));
+  ASSERT_THAT(unlink(file.path().c_str()), SyscallSucceeds());
+  ASSERT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  struct stat st;
+  ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_nlink, 0);
+}
+
 TEST(LinkTest, HardlinkChangeMode) {
   auto oldfile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const std::string newname = NewTempAbsPath();

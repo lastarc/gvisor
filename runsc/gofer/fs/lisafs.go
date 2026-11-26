@@ -1209,8 +1209,8 @@ func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uin
 		size = linux.XATTR_SIZE_MAX
 	}
 	data := getValueBuf(size)
-	if fd.IsSocket() || fd.IsSymlink() {
-		// Sockets and symlinks use O_PATH host FDs. However, fgetxattr(2) fails
+	if fd.usePathForXattrs() {
+		// The host FD may be an O_PATH FD, and fgetxattr(2) fails
 		// with EBADF for O_PATH FDs. Use lgetxattr(2) instead.
 		xattrSize, err := unix.Lgetxattr(fd.Node().FilePath(), name, data)
 		return uint16(xattrSize), err
@@ -1219,10 +1219,18 @@ func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uin
 	return uint16(xattrSize), err
 }
 
+// usePathForXattrs returns true if xattr syscalls on fd must use the file path
+// instead of the host FD. Sockets and symlinks use O_PATH host FDs. Other files
+// that are not regular files or directories, such as device files without a
+// device, may also use O_PATH host FDs.
+func (fd *controlFDLisa) usePathForXattrs() bool {
+	return !fd.IsRegular() && !fd.IsDir()
+}
+
 // SetXattr implements lisafs.ControlFDImpl.SetXattr.
 func (fd *controlFDLisa) SetXattr(name string, value string, flags uint32) error {
-	if fd.IsSocket() || fd.IsSymlink() {
-		// Sockets and symlinks use O_PATH host FDs. However, fsetxattr(2) fails
+	if fd.usePathForXattrs() {
+		// The host FD may be an O_PATH FD, and fsetxattr(2) fails
 		// with EBADF for O_PATH FDs. Use lsetxattr(2) instead.
 		return unix.Lsetxattr(fd.Node().FilePath(), name, []byte(value), int(flags))
 	}
@@ -1230,8 +1238,8 @@ func (fd *controlFDLisa) SetXattr(name string, value string, flags uint32) error
 }
 
 func (fd *controlFDLisa) listXattr(data []byte) (int, error) {
-	if fd.IsSocket() || fd.IsSymlink() {
-		// Sockets and symlinks use O_PATH host FDs. However, flistxattr(2) fails
+	if fd.usePathForXattrs() {
+		// The host FD may be an O_PATH FD, and flistxattr(2) fails
 		// with EBADF for O_PATH FDs. Use llistxattr(2) instead.
 		return unix.Llistxattr(fd.Node().FilePath(), data)
 	}
@@ -1275,8 +1283,8 @@ func (fd *controlFDLisa) ListXattr(size uint64) (lisafs.StringArray, error) {
 
 // RemoveXattr implements lisafs.ControlFDImpl.RemoveXattr.
 func (fd *controlFDLisa) RemoveXattr(name string) error {
-	if fd.IsSocket() || fd.IsSymlink() {
-		// Sockets and symlinks use O_PATH host FDs. However, fremovexattr(2) fails
+	if fd.usePathForXattrs() {
+		// The host FD may be an O_PATH FD, and fremovexattr(2) fails
 		// with EBADF for O_PATH FDs. Use lremovexattr(2) instead.
 		return unix.Lremovexattr(fd.Node().FilePath(), name)
 	}

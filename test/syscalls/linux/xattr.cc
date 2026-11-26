@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
@@ -337,6 +338,40 @@ TEST_F(XattrTest, XattrOnInvalidFileTypes) {
   EXPECT_THAT(getxattr(path, name, nullptr, 0), SyscallFailsWithErrno(ENODATA));
   EXPECT_THAT(listxattr(path, nullptr, 0), SyscallSucceedsWithValue(0));
   EXPECT_THAT(removexattr(path, name), SyscallFailsWithErrno(EPERM));
+}
+
+// Device files, whiteouts and FIFOs in the test directory, which can be on a
+// gofer filesystem, behave like the files in XattrOnInvalidFileTypes.
+TEST_F(XattrTest, XattrOnSpecialFilesInTestDirectory) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_MKNOD)));
+  const char name[] = "user.test";
+  const struct {
+    const char* name;
+    mode_t mode;
+    dev_t dev;
+  } files[] = {
+      {"whiteout", S_IFCHR | S_IRUSR | S_IWUSR, makedev(0, 0)},
+      {"chr", S_IFCHR | S_IRUSR | S_IWUSR, makedev(1, 3)},
+      {"blk", S_IFBLK | S_IRUSR | S_IWUSR, makedev(7, 0)},
+      {"fifo", S_IFIFO | S_IRUSR | S_IWUSR, 0},
+  };
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  for (const auto& file : files) {
+    SCOPED_TRACE(file.name);
+    const std::string path = JoinPath(dir.path(), file.name);
+    if (mknod(path.c_str(), file.mode, file.dev) != 0) {
+      // Some filesystems, such as a host overlayfs under a gofer, do not
+      // allow some device files.
+      ASSERT_EQ(errno, EPERM);
+      continue;
+    }
+    EXPECT_THAT(listxattr(path.c_str(), nullptr, 0), SyscallSucceeds());
+    EXPECT_THAT(getxattr(path.c_str(), name, nullptr, 0),
+                SyscallFailsWithErrno(ENODATA));
+    EXPECT_THAT(setxattr(path.c_str(), name, nullptr, 0, /*flags=*/0),
+                SyscallFailsWithErrno(EPERM));
+    EXPECT_THAT(removexattr(path.c_str(), name), SyscallFailsWithErrno(EPERM));
+  }
 }
 
 TEST_F(XattrTest, SetXattrSizeSmallerThanValue) {

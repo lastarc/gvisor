@@ -570,6 +570,14 @@ func (i *directfsInode) getXattr(ctx context.Context, name string, size uint64, 
 	defer xattrBufPool.Put(bPtr)
 	data := (*bPtr)[:size]
 	sz, err := unix.Fgetxattr(i.controlFD, name, data)
+	if err == unix.EBADF {
+		// Files that cannot be opened, such as device files without a device,
+		// also use O_PATH control FDs. Fall back to lisafs.
+		if err := i.ensureLisafsControlFD(ctx, d); err != nil {
+			return "", err
+		}
+		return i.controlFDLisa.GetXattr(ctx, name, size)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -585,7 +593,16 @@ func (i *directfsInode) setXattr(ctx context.Context, opts *vfs.SetXattrOptions,
 		}
 		return i.controlFDLisa.SetXattr(ctx, opts.Name, opts.Value, opts.Flags)
 	}
-	return unix.Fsetxattr(i.controlFD, opts.Name, []byte(opts.Value), int(opts.Flags))
+	err := unix.Fsetxattr(i.controlFD, opts.Name, []byte(opts.Value), int(opts.Flags))
+	if err == unix.EBADF {
+		// Files that cannot be opened, such as device files without a device,
+		// also use O_PATH control FDs. Fall back to lisafs.
+		if err := i.ensureLisafsControlFD(ctx, d); err != nil {
+			return err
+		}
+		return i.controlFDLisa.SetXattr(ctx, opts.Name, opts.Value, opts.Flags)
+	}
+	return err
 }
 
 func (i *directfsInode) listXattr(ctx context.Context, size uint64, d *dentry) ([]string, error) {
@@ -608,6 +625,14 @@ func (i *directfsInode) listXattr(ctx context.Context, size uint64, d *dentry) (
 	defer xattrBufPool.Put(bPtr)
 	data := (*bPtr)[:size]
 	sz, err := unix.Flistxattr(i.controlFD, data)
+	if err == unix.EBADF {
+		// Files that cannot be opened, such as device files without a device,
+		// also use O_PATH control FDs. Fall back to lisafs.
+		if err := i.ensureLisafsControlFD(ctx, d); err != nil {
+			return nil, err
+		}
+		return i.controlFDLisa.ListXattr(ctx, size)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +658,16 @@ func (i *directfsInode) removeXattr(ctx context.Context, name string, d *dentry)
 		}
 		return i.controlFDLisa.RemoveXattr(ctx, name)
 	}
-	return unix.Fremovexattr(i.controlFD, name)
+	err := unix.Fremovexattr(i.controlFD, name)
+	if err == unix.EBADF {
+		// Files that cannot be opened, such as device files without a device,
+		// also use O_PATH control FDs. Fall back to lisafs.
+		if err := i.ensureLisafsControlFD(ctx, d); err != nil {
+			return err
+		}
+		return i.controlFDLisa.RemoveXattr(ctx, name)
+	}
+	return err
 }
 
 // getCreatedChild opens the newly created child, sets its uid/gid, constructs

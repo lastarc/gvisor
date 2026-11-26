@@ -300,6 +300,28 @@ TEST(RenameTest, LinkOverwritesLinkToSameFileThenXattr) {
   EXPECT_THAT(removexattr(link_path.c_str(), "user.a"), SyscallSucceeds());
 }
 
+// A rename that replaces a link of a file removes that link.
+TEST(RenameTest, FileOverwritesLinkOfOtherFile) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(dir.path(), "file", TempPath::kDefaultFileMode));
+  const std::string link_path = JoinPath(dir.path(), "link");
+  ASSERT_THAT(link(file.path().c_str(), link_path.c_str()), SyscallSucceeds());
+  auto other = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      dir.path(), "other", TempPath::kDefaultFileMode));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(link_path, O_RDONLY));
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(2));
+
+  ASSERT_THAT(rename(other.path().c_str(), link_path.c_str()),
+              SyscallSucceeds());
+  EXPECT_THAT(Links(file.path()), IsPosixErrorOkAndHolds(1));
+  EXPECT_THAT(GetContents(link_path), IsPosixErrorOkAndHolds("other"));
+  struct stat st;
+  ASSERT_THAT(fstat(fd.get(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_nlink, 1);
+}
+
 TEST(RenameTest, FileOverwritesLinkToSameFileInOtherDirectory) {
   // gVisor's FUSE client sends a rename between links to the same file to the
   // FUSE server.
