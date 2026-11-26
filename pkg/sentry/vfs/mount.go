@@ -1538,6 +1538,12 @@ func (vfs *VirtualFilesystem) getMountpoint(ctx context.Context, creds *auth.Cre
 		if mnt := vfs.getMountAt(ctx, vd.mount, vd.dentry); mnt != nil {
 			vd.mount.DecRef(ctx)
 			vd.mount = mnt
+		} else if vd.dentry != vd.mount.root {
+			// No mount is at (vd.mount, vd.dentry). vd.dentry is a mount
+			// point only in other mounts of its filesystem, or only for a
+			// short time while mounts move (see pinMountpoint).
+			vd.DecRef(ctx)
+			return VirtualDentry{}, linuxerr.EINVAL
 		}
 	} else if vd.dentry != vd.mount.root {
 		vd.DecRef(ctx)

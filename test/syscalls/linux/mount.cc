@@ -234,6 +234,32 @@ TEST(MountTest, UmountNoFollow) {
   mount.Release();
 }
 
+// umount of a directory that is a mount point only in another mount of the
+// same filesystem fails with EINVAL, and leaves the mounts unchanged.
+TEST(MountTest, UmountMountPointOfOtherMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const bind_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "mode=0700", MNT_DETACH));
+  ASSERT_THAT(mount(nullptr, dir.path().c_str(), nullptr, MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+  const std::string point = JoinPath(dir.path(), "point");
+  ASSERT_THAT(mkdir(point.c_str(), 0700), SyscallSucceeds());
+  auto const bind_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(dir.path(), bind_dir.path(), "", MS_BIND, "", MNT_DETACH));
+  const std::string bind_point = JoinPath(bind_dir.path(), "point");
+  auto const point_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", bind_point, kTmpfs, 0, "mode=0700", MNT_DETACH));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(bind_point, "file"), "", 0600));
+
+  EXPECT_THAT(umount2(point.c_str(), 0), SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(Exists(JoinPath(bind_point, "file")),
+              IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(point), IsPosixErrorOkAndHolds(true));
+}
+
 TEST(MountTest, UmountDetach) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
