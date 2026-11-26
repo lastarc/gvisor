@@ -1092,7 +1092,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
 	// could result in this filesystem being released which acquires fs.mu.
 	var toDecRef []refs.RefCounter
+	var layerOp *vfs.LayerOperation
 	defer func() {
+		layerOp.Finish(ctx)
 		for _, ref := range toDecRef {
 			ref.DecRef(ctx)
 		}
@@ -1304,7 +1306,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
-	handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)
+	handle, err := vfsObj.PrepareRenameDentry(ctx, mntns, &renamed.vfsd, replacedVFSD)
 	if err != nil {
 		return err
 	}
@@ -1317,7 +1319,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		}
 	}()
-	err = fs.renameUpperLocked(ctx, oldParent, oldName, renamed, newParent, newName, replaced, replacedLayer, replacedWhiteouts, exchange)
+	var layerCtx context.Context
+	layerCtx, layerOp = vfs.WithLayerOperation(ctx)
+	err = fs.renameUpperLocked(layerCtx, oldParent, oldName, renamed, newParent, newName, replaced, replacedLayer, replacedWhiteouts, exchange)
 	prepared = false
 	if err != nil {
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
@@ -1589,7 +1593,9 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	// We need to DecRef outside of fs.mu because forgetting a dead mountpoint
 	// could result in this filesystem being released which acquires fs.mu.
 	var toDecRef []refs.RefCounter
+	var layerOp *vfs.LayerOperation
 	defer func() {
+		layerOp.Finish(ctx)
 		for _, ref := range toDecRef {
 			ref.DecRef(ctx)
 		}
@@ -1648,7 +1654,7 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	}
 	child.copyMu.RLock()
 	defer child.copyMu.RUnlock()
-	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+	if err := vfsObj.PrepareDeleteDentry(ctx, mntns, &child.vfsd); err != nil {
 		return err
 	}
 	// Dentry.mu of child is locked until CommitDeleteDentry or
@@ -1660,30 +1666,32 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 			vfsObj.AbortDeleteDentry(&child.vfsd)
 		}
 	}()
+	var layerCtx context.Context
+	layerCtx, layerOp = vfs.WithLayerOperation(ctx)
 
 	switch {
-	case child.upperVD.Ok() && fs.lowerLayersHaveChildLocked(ctx, parent, name):
+	case child.upperVD.Ok() && fs.lowerLayersHaveChildLocked(layerCtx, parent, name):
 		// Replace the directory with a whiteout in one exchange. Then remove the
 		// directory, which now has a temporary name.
 		var tmpName string
-		if tmpName, err = fs.createTempWhiteout(ctx, parent.upperVD); err != nil {
+		if tmpName, err = fs.createTempWhiteout(layerCtx, parent.upperVD); err != nil {
 			break
 		}
-		if err = fs.exchangeUpper(ctx, parent.upperVD, tmpName, parent.upperVD, name); err != nil {
-			fs.unlinkTemp(ctx, parent.upperVD, tmpName)
+		if err = fs.exchangeUpper(layerCtx, parent.upperVD, tmpName, parent.upperVD, name); err != nil {
+			fs.unlinkTemp(layerCtx, parent.upperVD, tmpName)
 			break
 		}
-		fs.removeTempDir(ctx, parent.upperVD, tmpName, child.upperVD, whiteouts)
+		fs.removeTempDir(layerCtx, parent.upperVD, tmpName, child.upperVD, whiteouts)
 
 	case child.upperVD.Ok():
 		// No lower layer has a file at name, so no whiteout is necessary, and
 		// whiteouts in the directory hide nothing.
-		err = fs.removeUpperDir(ctx, parent.upperVD, name, child.upperVD, whiteouts)
+		err = fs.removeUpperDir(layerCtx, parent.upperVD, name, child.upperVD, whiteouts)
 
 	default:
 		// The directory is only on lower layers.
 		pop := layerChildPop(parent.upperVD, name)
-		err = CreateWhiteout(ctx, vfsObj, fs.creds, &pop)
+		err = CreateWhiteout(layerCtx, vfsObj, fs.creds, &pop)
 	}
 	prepared = false
 	if err != nil {
@@ -1873,7 +1881,9 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	// mountpoint could result in this filesystem being released which acquires
 	// fs.renameMu.
 	var toDecRef []refs.RefCounter
+	var layerOp *vfs.LayerOperation
 	defer func() {
+		layerOp.Finish(ctx)
 		for _, ref := range toDecRef {
 			ref.DecRef(ctx)
 		}
@@ -1941,7 +1951,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	// A copy-up running without renameMu may have finished just now, so read
 	// the layer only under copyMu.
 	childLayer := child.topLookupLayer()
-	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+	if err := vfsObj.PrepareDeleteDentry(ctx, mntns, &child.vfsd); err != nil {
 		return err
 	}
 	// Dentry.mu of child is locked until CommitDeleteDentry or
@@ -1953,18 +1963,20 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 			vfsObj.AbortDeleteDentry(&child.vfsd)
 		}
 	}()
+	var layerCtx context.Context
+	layerCtx, layerOp = vfs.WithLayerOperation(ctx)
 
 	pop := layerChildPop(parent.upperVD, name)
 	switch {
-	case childLayer == lookupLayerUpper && fs.lowerLayersHaveChildLocked(ctx, parent, name):
+	case childLayer == lookupLayerUpper && fs.lowerLayersHaveChildLocked(layerCtx, parent, name):
 		// Replace the file on the upper layer with a whiteout in one rename.
-		err = fs.replaceWithWhiteout(ctx, parent.upperVD, name)
+		err = fs.replaceWithWhiteout(layerCtx, parent.upperVD, name)
 	case childLayer == lookupLayerUpper:
 		// No lower layer has a file at name, so no whiteout is necessary.
-		err = vfsObj.UnlinkAt(ctx, fs.creds, &pop)
+		err = vfsObj.UnlinkAt(layerCtx, fs.creds, &pop)
 	default:
 		// The file is only on lower layers.
-		err = CreateWhiteout(ctx, vfsObj, fs.creds, &pop)
+		err = CreateWhiteout(layerCtx, vfsObj, fs.creds, &pop)
 	}
 	prepared = false
 	if err != nil {

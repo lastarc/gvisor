@@ -186,6 +186,7 @@ func (vfs *VirtualFilesystem) loadMountPromises(_ goContext.Context, mps map[Vir
 
 // afterLoad is called by stateify.
 func (mnt *Mount) afterLoad(goContext.Context) {
+	mnt.flagBits.Store(mnt.flags.bits())
 	if mnt.refs.Load() != 0 {
 		refs.Register(mnt)
 	}

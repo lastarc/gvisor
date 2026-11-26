@@ -32,7 +32,14 @@
 //	VirtualFilesystem.fsTypesMu
 //
 // Locking Dentry.mu in multiple Dentries requires holding
-// VirtualFilesystem.mountMu. Locking EpollInstance.interestMu in multiple
+// VirtualFilesystem.mountMu, or a lock that serializes renames in the
+// Filesystem of the Dentries (see PrepareRenameDentry). A FilesystemImpl that
+// changes another Filesystem between Prepare*Dentry and Commit*Dentry or
+// Abort*Dentry locks the Dentry.mu of the other Filesystem after its own
+// Dentry.mu, and must not lock VirtualFilesystem.mountMu (see
+// LayerOperation). Mount code locks Dentry.mu before it starts a writer
+// critical section of VirtualFilesystem.mounts.seq, because holders of
+// Dentry.mu walk paths. Locking EpollInstance.interestMu in multiple
 // EpollInstances requires holding epollCycleMu.
 package vfs
 

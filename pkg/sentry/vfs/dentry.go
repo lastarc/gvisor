@@ -209,19 +209,101 @@ func (d *Dentry) OnZeroWatches(ctx context.Context) {
 // use them. The vfs package, and users of VFS, should not call these
 // functions.
 
+// layerOperationKey is the context key for WithLayerOperation.
+type layerOperationKey struct{}
+
+// LayerOperation is an operation that a FilesystemImpl does on another
+// Filesystem, such as a layer of an overlay, while it holds the Dentry.mu of
+// one of its own Dentries. Mounting locks vfs.mountMu before Dentry.mu, so in
+// a LayerOperation, VFS does not lock vfs.mountMu:
+//   - PrepareDeleteDentry and PrepareRenameDentry fail with EBUSY for a
+//     Dentry with mounts in any mount namespace.
+//   - InvalidateDentry and Mount.DecRef record their changes to mounts in the
+//     LayerOperation. Finish does them.
+type LayerOperation struct {
+	vfs *VirtualFilesystem
+
+	// deadMountpoints are the dead Dentries whose mounts Finish forgets.
+	deadMountpoints []*Dentry
+
+	// mounts are the Mounts without references that Finish destroys.
+	mounts []*Mount
+}
+
+// layerOperationContext is the context of a LayerOperation.
+type layerOperationContext struct {
+	context.Context
+	op LayerOperation
+}
+
+// Value implements context.Context.Value.
+func (c *layerOperationContext) Value(key any) any {
+	if key == (layerOperationKey{}) {
+		return &c.op
+	}
+	return c.Context.Value(key)
+}
+
+// WithLayerOperation returns a new LayerOperation, and a context for it from
+// ctx.
+func WithLayerOperation(ctx context.Context) (context.Context, *LayerOperation) {
+	c := &layerOperationContext{Context: ctx}
+	return c, &c.op
+}
+
+// layerOperationFromContext returns the LayerOperation of ctx, or nil.
+func layerOperationFromContext(ctx context.Context) *LayerOperation {
+	op, _ := ctx.Value(layerOperationKey{}).(*LayerOperation)
+	return op
+}
+
+// Finish does the changes to mounts that op recorded. The FilesystemImpl must
+// call Finish after it unlocks its locks, with a context that is not from
+// WithLayerOperation. If op is nil, Finish does nothing.
+func (op *LayerOperation) Finish(ctx context.Context) {
+	if op == nil {
+		return
+	}
+	for len(op.deadMountpoints) != 0 || len(op.mounts) != 0 {
+		deadMountpoints := op.deadMountpoints
+		mounts := op.mounts
+		op.deadMountpoints = nil
+		op.mounts = nil
+		for _, d := range deadMountpoints {
+			for _, rc := range op.vfs.forgetDeadMountpoint(ctx, d) {
+				rc.DecRef(ctx)
+			}
+		}
+		for _, mnt := range mounts {
+			mnt.destroy(ctx)
+		}
+	}
+}
+
 // PrepareDeleteDentry must be called before attempting to delete the file
 // represented by d. If PrepareDeleteDentry succeeds, the caller must call
 // AbortDeleteDentry or CommitDeleteDentry depending on the deletion's outcome.
 // +checklocksacquire:d.mu
-func (vfs *VirtualFilesystem) PrepareDeleteDentry(mntns *MountNamespace, d *Dentry) error {
+func (vfs *VirtualFilesystem) PrepareDeleteDentry(ctx context.Context, mntns *MountNamespace, d *Dentry) error {
+	// Mounts connect to d only while d.mu is locked. Thus if d has no mounts
+	// while d.mu is locked, d is not a mount point, and vfs.mountMu is not
+	// necessary.
+	d.mu.Lock()
+	if !d.isMounted() {
+		// Return with d.mu locked to block attempts to mount over it; it will
+		// be unlocked by AbortDeleteDentry or CommitDeleteDentry.
+		return nil
+	}
+	d.mu.Unlock()
+	if layerOperationFromContext(ctx) != nil {
+		return linuxerr.EBUSY // +checklocksforce: inconsistent return.
+	}
 	vfs.lockMounts()
 	defer vfs.unlockMounts(context.Background())
 	if mntns.mountpoints[d] != 0 {
 		return linuxerr.EBUSY // +checklocksforce: inconsistent return.
 	}
 	d.mu.Lock()
-	// Return with d.mu locked to block attempts to mount over it; it will be
-	// unlocked by AbortDeleteDentry or CommitDeleteDentry.
 	return nil
 }
 
@@ -254,10 +336,17 @@ func (vfs *VirtualFilesystem) InvalidateDentry(ctx context.Context, d *Dentry) [
 	d.mu.Lock()
 	d.dead = true
 	d.mu.Unlock()
-	if d.isMounted() {
-		return vfs.forgetDeadMountpoint(ctx, d)
+	if !d.isMounted() {
+		return nil
 	}
-	return nil
+	if op := layerOperationFromContext(ctx); op != nil {
+		// forgetDeadMountpoint locks vfs.mountMu. d is dead, so no new mounts
+		// connect to d until op.Finish.
+		op.vfs = vfs
+		op.deadMountpoints = append(op.deadMountpoints, d)
+		return nil
+	}
+	return vfs.forgetDeadMountpoint(ctx, d)
 }
 
 // renameEnd updates vfs.renameState to account for a completed in-progress rename.
@@ -307,10 +396,31 @@ const (
 // Preconditions:
 //   - If to is not nil, it must be a child Dentry from the same Filesystem.
 //   - from != to.
+//   - The caller must hold a lock that serializes renames in the Filesystem
+//     of from and to.
 //
 // +checklocksacquire:from.mu
 // +checklocksacquire:to.mu
-func (vfs *VirtualFilesystem) PrepareRenameDentry(mntns *MountNamespace, from, to *Dentry) (RenameHandle, error) {
+func (vfs *VirtualFilesystem) PrepareRenameDentry(ctx context.Context, mntns *MountNamespace, from, to *Dentry) (RenameHandle, error) {
+	// As in PrepareDeleteDentry, vfs.mountMu is not necessary if from and to
+	// have no mounts while their Dentry.mu are locked.
+	if to != nil {
+		to.mu.Lock()
+	}
+	from.mu.Lock()
+	if !from.isMounted() && (to == nil || !to.isMounted()) {
+		// Return with from.mu and to.mu locked, which will be unlocked by
+		// AbortRenameDentry, CommitRenameReplaceDentry, or
+		// CommitRenameExchangeDentry.
+		return RenameHandle{}, nil // +checklocksforce: to may not be acquired.
+	}
+	from.mu.Unlock()
+	if to != nil {
+		to.mu.Unlock()
+	}
+	if layerOperationFromContext(ctx) != nil {
+		return RenameHandle{}, linuxerr.EBUSY // +checklocksforce: no locks acquired.
+	}
 	vfs.lockMounts()
 	defer vfs.unlockMounts(context.Background())
 	if mntns.mountpoints[from] != 0 {

@@ -92,6 +92,11 @@ type Mount struct {
 	// VirtualFilesystem.mountMu.
 	flags MountFlags
 
+	// flagBits is flags as a mask of ST_* flags, for readers that do not lock
+	// VirtualFilesystem.mountMu. flagBits is changed only while mountMu is
+	// locked, and is accessed using atomic memory operations.
+	flagBits atomicbitops.Uint64 `state:"nosave"`
+
 	// key is protected by VirtualFilesystem.mountMu and
 	// VirtualFilesystem.mounts.seq, and may be nil. References are held on
 	// key.parent and key.point if they are not nil.
@@ -171,18 +176,41 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 	if opts.lockReadOnly {
 		mnt.lockedFlags.readOnly = true
 	}
+	mnt.flagBits.Store(opts.Flags.bits())
 	mnt.sharedEntry.Init(mnt)
 	refs.Register(mnt)
 	return mnt
 }
 
+// bits returns f as a mask of ST_* flags.
+func (f MountFlags) bits() uint64 {
+	var bits uint64
+	if f.NoExec {
+		bits |= linux.ST_NOEXEC
+	}
+	if f.NoATime {
+		bits |= linux.ST_NOATIME
+	}
+	if f.NoDev {
+		bits |= linux.ST_NODEV
+	}
+	if f.NoSUID {
+		bits |= linux.ST_NOSUID
+	}
+	return bits
+}
+
 // Options returns a copy of the MountOptions currently applicable to mnt.
 func (mnt *Mount) Options() MountOptions {
-	mnt.vfs.lockMounts()
-	defer mnt.vfs.unlockMounts(context.Background())
+	bits := mnt.flagBits.Load()
 	return MountOptions{
-		Flags:    mnt.flags,
-		ReadOnly: mnt.ReadOnlyLocked(),
+		Flags: MountFlags{
+			NoExec:  bits&linux.ST_NOEXEC != 0,
+			NoATime: bits&linux.ST_NOATIME != 0,
+			NoDev:   bits&linux.ST_NODEV != 0,
+			NoSUID:  bits&linux.ST_NOSUID != 0,
+		},
+		ReadOnly: mnt.writers.Load() < 0,
 	}
 }
 
@@ -217,27 +245,14 @@ func (mnt *Mount) setMountOptions(opts *MountOptions) error {
 		return err
 	}
 	mnt.flags = opts.Flags
+	mnt.flagBits.Store(opts.Flags.bits())
 	return nil
 }
 
 // MountFlags returns a bit mask that indicates mount options.
 func (mnt *Mount) MountFlags() uint64 {
-	mnt.vfs.lockMounts()
-	defer mnt.vfs.unlockMounts(context.Background())
-	var flags uint64
-	if mnt.flags.NoExec {
-		flags |= linux.ST_NOEXEC
-	}
-	if mnt.flags.NoATime {
-		flags |= linux.ST_NOATIME
-	}
-	if mnt.flags.NoDev {
-		flags |= linux.ST_NODEV
-	}
-	if mnt.flags.NoSUID {
-		flags |= linux.ST_NOSUID
-	}
-	if mnt.ReadOnlyLocked() {
+	flags := mnt.flagBits.Load()
+	if mnt.writers.Load() < 0 {
 		flags |= linux.ST_RDONLY
 	}
 	return flags
@@ -613,7 +628,7 @@ func (vfs *VirtualFilesystem) MoveMountAt(ctx context.Context, creds *auth.Crede
 //
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) lockMountpoint(vd VirtualDentry) (VirtualDentry, error) {
-	vd.dentry.mu.Lock()
+	vfs.lockMountpointDentry(vd.dentry)
 	for {
 		if vd.mount.umounted || vd.dentry.dead {
 			vd.dentry.mu.Unlock()
@@ -644,9 +659,26 @@ func (vfs *VirtualFilesystem) lockMountpoint(vd VirtualDentry) (VirtualDentry, e
 			mount:  nextmnt,
 			dentry: nextmnt.root,
 		}
-		vd.dentry.mu.Lock()
+		vfs.lockMountpointDentry(vd.dentry)
 	}
 	return vd, nil
+}
+
+// lockMountpointDentry locks d.mu. A holder of d.mu can wait for a lock whose
+// holder waits for vfs.mountMu, for example an overlay that changes its upper
+// layer. Thus lockMountpointDentry does not wait for d.mu while it holds
+// vfs.mountMu.
+//
+// +checklocks:vfs.mountMu
+// +checklocksacquire:d.mu
+// +checklocksignore
+func (vfs *VirtualFilesystem) lockMountpointDentry(d *Dentry) {
+	for !d.mu.TryLock() {
+		vfs.mountMu.Unlock()
+		d.mu.Lock()
+		d.mu.Unlock()
+		vfs.mountMu.Lock()
+	}
 }
 
 // CloneMountAt returns a new mount with the same fs, specified root and
@@ -1350,6 +1382,12 @@ func (mnt *Mount) DecRef(ctx context.Context) {
 	}
 	if r&^math.MinInt64 == 0 { // mask out MSB
 		refs.Unregister(mnt)
+		if op := layerOperationFromContext(ctx); op != nil {
+			// destroy locks vfs.mountMu.
+			op.vfs = mnt.vfs
+			op.mounts = append(op.mounts, mnt)
+			return
+		}
 		mnt.destroy(ctx)
 	}
 }
@@ -1624,6 +1662,14 @@ func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credent
 	}
 	cleanup.Release()
 
+	// Keep the mount point of oldRoot.mount locked while the mounts move, so
+	// that it stays a mount point for holders of its Dentry.mu; see
+	// PrepareDeleteDentry. Lock it before the writer critical section of
+	// vfs.mounts.seq, because a holder of the Dentry.mu can walk paths.
+	rootMpDentry := oldRoot.mount.getKey().dentry
+	if rootMpDentry != putOld.dentry {
+		rootMpDentry.mu.Lock()
+	}
 	vfs.mounts.seq.BeginWrite()
 	mp := vfs.disconnectLocked(newRoot.mount)
 	vfs.delayDecRef(mp)
@@ -1635,12 +1681,12 @@ func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credent
 
 	putOld.IncRef()
 	vfs.connectLocked(oldRoot.mount, putOld, putOld.mount.ns)
-	putOld.dentry.mu.Unlock()
-
-	rootMp.dentry.mu.Lock()
 	vfs.connectLocked(newRoot.mount, rootMp, rootMp.mount.ns)
-	rootMp.dentry.mu.Unlock()
 	vfs.mounts.seq.EndWrite()
+	if rootMpDentry != putOld.dentry {
+		rootMpDentry.mu.Unlock()
+	}
+	putOld.dentry.mu.Unlock()
 
 	vfs.delayDecRef(newRoot.mount)
 	vfs.delayDecRef(oldRoot.mount)
@@ -1696,8 +1742,6 @@ func (mnt *Mount) setReadOnlyLocked(ro bool) error {
 
 // ReadOnly returns true if mount is readonly.
 func (mnt *Mount) ReadOnly() bool {
-	mnt.vfs.lockMounts()
-	defer mnt.vfs.unlockMounts(context.Background())
 	return mnt.writers.Load() < 0
 }
 

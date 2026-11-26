@@ -36,6 +36,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -49,6 +50,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
@@ -935,6 +938,104 @@ TEST(OverlayTest, CopyUpOfMappedFile) {
   EXPECT_THAT(
       ListDir(upper.path(), /*skipdots=*/true),
       IsPosixErrorOkAndHolds(UnorderedElementsAreArray({"a", "b", "link"})));
+}
+
+// Tests that a mount over a file in an overlay that races with unlink or
+// rename of the file does not deadlock.
+TEST(OverlayTest, MountRacesWithRemoval) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // The upper layer cannot be on overlayfs, so use a tmpfs there.
+  Cleanup tmpfs_mount;
+  if (ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()))) {
+    tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(kTmpfs, base_dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  }
+  auto lower =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto upper =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto merged =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(lower.path(), "f"), "", 0644));
+  auto src = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  std::string opts =
+      absl::StrCat("lowerdir=", lower.path(), ",upperdir=", upper.path(),
+                   ",workdir=", work.path(), ",userxattr");
+  Cleanup overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", merged.path(), "overlay", 0, opts, 0));
+
+  const std::string target = JoinPath(merged.path(), "f");
+  const std::string renamed = JoinPath(merged.path(), "g");
+  std::atomic<bool> stop(false);
+  ScopedThread mounter([&] {
+    while (!stop.load()) {
+      if (mount(src.path().c_str(), target.c_str(), nullptr, MS_BIND,
+                nullptr) == 0) {
+        // A concurrent rename can move the file to renamed before the mount.
+        if (umount2(target.c_str(), MNT_DETACH) != 0) {
+          TEST_PCHECK(umount2(renamed.c_str(), MNT_DETACH) == 0);
+        }
+      }
+    }
+  });
+  const absl::Time end = absl::Now() + absl::Seconds(1);
+  for (int i = 0; absl::Now() < end; i++) {
+    int fd = open(target.c_str(), O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) {
+      close(fd);
+    }
+    if (i % 2 == 0) {
+      unlink(target.c_str());
+    } else {
+      rename(target.c_str(), renamed.c_str());
+      unlink(renamed.c_str());
+    }
+  }
+  stop.store(true);
+  mounter.Join();
+}
+
+// Tests that removal of an overlay file whose upper layer file is a mount
+// point fails with EBUSY, and does not deadlock with a mount over the overlay
+// file.
+TEST(OverlayTest, RemovalOfFileWithMountedUpperRacesWithMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  OverlayOnTmpfs o = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
+  SKIP_IF(!SupportsOverlayUpperXattrs(o.upper));
+  ASSERT_NO_ERRNO(CreateWithContents(o.LowerPath("f"), "lower", 0644));
+  ASSERT_NO_ERRNO(CreateWithContents(o.UpperPath("f"), "upper", 0644));
+  ASSERT_NO_ERRNO(o.MountOverlay());
+  auto src = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  Cleanup upper_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(src.path(), o.UpperPath("f"), "", MS_BIND, "", MNT_DETACH));
+
+  const std::string target = o.MergedPath("f");
+  const std::string renamed = o.MergedPath("g");
+  std::atomic<bool> stop(false);
+  ScopedThread mounter([&] {
+    while (!stop.load()) {
+      if (mount(src.path().c_str(), target.c_str(), nullptr, MS_BIND,
+                nullptr) == 0) {
+        TEST_PCHECK(umount2(target.c_str(), MNT_DETACH) == 0);
+      }
+    }
+  });
+  const absl::Time end = absl::Now() + absl::Seconds(1);
+  for (int i = 0; absl::Now() < end; i++) {
+    if (i % 2 == 0) {
+      TEST_PCHECK(unlink(target.c_str()) != 0 && errno == EBUSY);
+    } else {
+      TEST_PCHECK(rename(target.c_str(), renamed.c_str()) != 0 &&
+                  errno == EBUSY);
+    }
+  }
+  stop.store(true);
+  mounter.Join();
+  EXPECT_THAT(GetContents(target), IsPosixErrorOkAndHolds("upper"));
 }
 
 // UpperLayerOverlay mounts an overlay with layers in TEST_TMPDIR, which can be

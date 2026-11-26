@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -171,7 +172,7 @@ func (s *dentryTestSystem) walk(rp *ResolvingPath) error {
 // +checklocksignore
 func (s *dentryTestSystem) beginRename(t *testing.T) RenameHandle {
 	t.Helper()
-	handle, err := s.vfsObj.PrepareRenameDentry(s.mntns, s.renameD1.dentry(), s.renameD2.dentry())
+	handle, err := s.vfsObj.PrepareRenameDentry(context.Background(), s.mntns, s.renameD1.dentry(), s.renameD2.dentry())
 	if err != nil {
 		t.Fatalf("PrepareRenameDentry failed: %v", err)
 	}
@@ -387,4 +388,89 @@ func TestDotDotBeneathRaceWithRename(t *testing.T) {
 			t.Fatalf("walk: got error %v, want %v", err, linuxerr.EAGAIN)
 		}
 	})
+}
+
+// runWithMountMuLocked calls f while vfs.mountMu is locked, and fails if f
+// does not return.
+//
+// +checklocksignore
+func runWithMountMuLocked(t *testing.T, vfsObj *VirtualFilesystem, f func()) {
+	t.Helper()
+	vfsObj.lockMounts()
+	defer vfsObj.unlockMounts(context.Background())
+	done := make(chan struct{})
+	go func() {
+		f()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("operation waited for vfs.mountMu")
+	}
+}
+
+// +checklocksignore
+func TestLayerOperationInvalidateDentry(t *testing.T) {
+	s := newDentryTestSystem(t)
+	defer s.destroy()
+	mnt, err := s.vfsObj.MountDisconnected(s.ctx, s.creds, "", "dentrytest", &MountOptions{})
+	if err != nil {
+		t.Fatalf("MountDisconnected: %v", err)
+	}
+	mp := VirtualDentry{mount: s.rootVD.mount, dentry: s.childD.dentry()}
+	mp.IncRef()
+	s.vfsObj.lockMounts()
+	s.childD.dentry().mu.Lock()
+	s.vfsObj.mounts.seq.BeginWrite()
+	s.vfsObj.connectLocked(mnt, mp, s.mntns)
+	s.vfsObj.mounts.seq.EndWrite()
+	s.childD.dentry().mu.Unlock()
+	s.vfsObj.unlockMounts(s.ctx)
+	mnt.DecRef(s.ctx)
+
+	layerCtx, op := WithLayerOperation(s.ctx)
+	runWithMountMuLocked(t, s.vfsObj, func() {
+		if rcs := s.vfsObj.InvalidateDentry(layerCtx, s.childD.dentry()); len(rcs) != 0 {
+			t.Errorf("InvalidateDentry returned %d references, want 0", len(rcs))
+		}
+	})
+	if !s.childD.dentry().IsDead() {
+		t.Errorf("dentry is not dead after InvalidateDentry")
+	}
+	if !s.childD.dentry().isMounted() {
+		t.Fatalf("mount was removed before Finish")
+	}
+	op.Finish(s.ctx)
+	if s.childD.dentry().isMounted() {
+		t.Errorf("mount was not removed by Finish")
+	}
+}
+
+// +checklocksignore
+func TestLayerOperationMountDecRef(t *testing.T) {
+	s := newDentryTestSystem(t)
+	defer s.destroy()
+	mnt, err := s.vfsObj.MountDisconnected(s.ctx, s.creds, "", "dentrytest", &MountOptions{})
+	if err != nil {
+		t.Fatalf("MountDisconnected: %v", err)
+	}
+	fs := mnt.Filesystem()
+	hasFilesystem := func() bool {
+		s.vfsObj.filesystemsMu.Lock()
+		defer s.vfsObj.filesystemsMu.Unlock()
+		_, ok := s.vfsObj.filesystems[fs]
+		return ok
+	}
+	layerCtx, op := WithLayerOperation(s.ctx)
+	runWithMountMuLocked(t, s.vfsObj, func() {
+		mnt.DecRef(layerCtx)
+	})
+	if !hasFilesystem() {
+		t.Fatalf("mount was destroyed before Finish")
+	}
+	op.Finish(s.ctx)
+	if hasFilesystem() {
+		t.Errorf("mount was not destroyed by Finish")
+	}
 }

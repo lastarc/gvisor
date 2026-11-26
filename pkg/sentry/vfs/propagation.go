@@ -59,24 +59,34 @@ func (vfs *VirtualFilesystem) commitMount(ctx context.Context, mnt *Mount) {
 	// If there is already a mount at this (parent, point), disconnect it from its
 	// parent and reconnect it to mnt once mnt has been connected.
 	child := vfs.mounts.Lookup(mp.mount, mp.dentry)
+	// Lock mp.dentry.mu before child is disconnected, so that mp.dentry stays a
+	// mount point for holders of mp.dentry.mu; see PrepareDeleteDentry. Lock
+	// the Dentries before the writer critical section of vfs.mounts.seq,
+	// because a holder of a Dentry.mu can walk paths.
+	mp.dentry.mu.Lock()
+	newmp := VirtualDentry{mnt, mnt.root}
+	lockNewmp := child != nil && newmp.dentry != mp.dentry
+	if lockNewmp {
+		newmp.dentry.mu.Lock()
+	}
 	vfs.mounts.seq.BeginWrite()
 	if child != nil {
 		vfs.delayDecRef(vfs.disconnectLocked(child))
 	}
-	mp.dentry.mu.Lock()
 	vfs.connectLocked(mnt, mp, mp.mount.ns)
-	mp.dentry.mu.Unlock()
-	vfs.delayDecRef(mnt)
-
 	if child != nil {
-		newmp := VirtualDentry{mnt, mnt.root}
 		newmp.IncRef()
-		newmp.dentry.mu.Lock()
 		vfs.connectLocked(child, newmp, newmp.mount.ns)
-		newmp.dentry.mu.Unlock()
-		vfs.delayDecRef(child)
 	}
 	vfs.mounts.seq.EndWrite()
+	if lockNewmp {
+		newmp.dentry.mu.Unlock()
+	}
+	mp.dentry.mu.Unlock()
+	vfs.delayDecRef(mnt)
+	if child != nil {
+		vfs.delayDecRef(child)
+	}
 	vfs.commitChildren(ctx, mnt)
 }
 

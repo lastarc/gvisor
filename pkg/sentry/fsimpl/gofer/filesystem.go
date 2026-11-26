@@ -675,7 +675,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		// child.childrenMu before calling PrepareDeleteDentry.
 		child.childrenMu.Lock()
 		defer child.childrenMu.Unlock()
-		if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+		if err := vfsObj.PrepareDeleteDentry(ctx, mntns, &child.vfsd); err != nil {
 			return err
 		}
 	}
@@ -1656,7 +1656,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
-	handle, err := vfsObj.PrepareRenameDentry(mntns, &renamed.vfsd, replacedVFSD)
+	handle, err := vfsObj.PrepareRenameDentry(ctx, mntns, &renamed.vfsd, replacedVFSD)
 	if err != nil {
 		return err
 	}

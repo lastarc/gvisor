@@ -946,7 +946,7 @@ func (fs *Filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	}
 
 	srcVFSD := src.VFSDentry()
-	handle, err := virtfs.PrepareRenameDentry(mntns, srcVFSD, dstVFSD)
+	handle, err := virtfs.PrepareRenameDentry(ctx, mntns, srcVFSD, dstVFSD)
 	if err != nil {
 		return err
 	}
@@ -1022,7 +1022,7 @@ func (fs *Filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
 	vfsd := child.VFSDentry()
-	if err := virtfs.PrepareDeleteDentry(mntns, vfsd); err != nil {
+	if err := virtfs.PrepareDeleteDentry(ctx, mntns, vfsd); err != nil {
 		return err // +checklocksforce: vfsd is not locked.
 	}
 
@@ -1176,7 +1176,7 @@ func (fs *Filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef(ctx)
 	vfsd := d.VFSDentry()
-	if err := virtfs.PrepareDeleteDentry(mntns, vfsd); err != nil {
+	if err := virtfs.PrepareDeleteDentry(ctx, mntns, vfsd); err != nil {
 		return err
 	}
 	if err := parentDentry.inode.Unlink(ctx, d.name, d.inode); err != nil {
