@@ -62,6 +62,11 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 				// This file has been whited-out in a previous layer.
 				return nil
 			}
+			if isUpper && d.fs.isTempName(dirent.Name) {
+				// Temporary files on the upper layer are not visible, and
+				// removeUpperDir removes them.
+				return nil
+			}
 			if dirent.Type == linux.DT_CHR {
 				// We have to determine if this is a whiteout, which doesn't
 				// count against the directory's emptiness. However, we can't
@@ -206,6 +211,10 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 		maybeWhiteouts = maybeWhiteouts[:0]
 		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
+				return nil
+			}
+			if isUpper && d.fs.isTempName(dirent.Name) {
+				// Temporary files on the upper layer are not visible.
 				return nil
 			}
 			if _, ok := prevDirents[dirent.Name]; ok {

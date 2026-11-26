@@ -89,6 +89,9 @@ type FilesystemOptions struct {
 	// LowerRoots contains the roots of the immutable lower layers of the
 	// overlay. LowerRoots is immutable.
 	LowerRoots []vfs.VirtualDentry
+
+	// PrivateUpper is true if only the overlay accesses the upper layer.
+	PrivateUpper bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -110,6 +113,12 @@ type filesystem struct {
 
 	// xattrOpaque is xattrPrefix + "opaque". xattrOpaque is immutable.
 	xattrOpaque string
+
+	// tempNames contains the temporary file names on the upper layer that are
+	// in use; see upper.go.
+	tempNamesMu sync.Mutex `state:"nosave"`
+	// +checklocks:tempNamesMu
+	tempNames map[string]struct{}
 
 	// createCreds is a cache of credentials that is used for create operations.
 	createCredsMu createCredsMutex `state:"nosave"`

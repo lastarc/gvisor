@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -129,24 +128,30 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		return err
 	}
 
-	// Perform copy-up.
+	// Perform copy-up. The upper layer file is made with a temporary name, and
+	// moved to d.name when it is complete; see upper.go. If the upper layer is
+	// private, no other process can see the upper layer file before it is
+	// complete, so the file is made at d.name.
 	ftype := d.mode.Load() & linux.S_IFMT
-	newpop := vfs.PathOperation{
-		Root:  parent.upperVD,
-		Start: parent.upperVD,
-		Path:  fspath.Parse(d.name),
+	// Read d.name while renameMu is locked. d.name cannot change until
+	// d.copyMu is unlocked.
+	name := d.name
+	var tmpName string
+	upperName := name
+	if !d.fs.opts.PrivateUpper {
+		if tmpName, err = d.fs.newTempName(); err != nil {
+			return err
+		}
+		upperName = tmpName
 	}
+	newpop := layerChildPop(parent.upperVD, upperName)
 	// Used during copy-up of memory-mapped regular files.
 	var mmapOpts *memmap.MMapOpts
 	cleanupUndoCopyUp := func() {
-		var err error
-		if ftype == linux.S_IFDIR {
-			err = vfsObj.RmdirAt(ctx, d.fs.creds, &newpop)
+		if tmpName != "" {
+			d.fs.removeTemp(ctx, parent.upperVD, tmpName)
 		} else {
-			err = vfsObj.UnlinkAt(ctx, d.fs.creds, &newpop)
-		}
-		if err != nil {
-			panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to delete upper layer file after copy-up error: %v", err))
+			d.fs.removeUpperFile(ctx, parent.upperVD, name, ftype == linux.S_IFDIR)
 		}
 		if d.upperVD.Ok() {
 			d.upperVD.DecRef(ctx)
@@ -159,20 +164,30 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			Flags: linux.O_RDONLY,
 		})
 		if err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		defer oldFD.DecRef(ctx)
+		// Mappings of the file move to the upper layer file below. Some
+		// filesystems can map a file only through a readable FD.
+		newFlags := uint32(linux.O_WRONLY)
+		if d.wrappedMappable != nil {
+			newFlags = linux.O_RDWR
+		}
 		newFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &newpop, &vfs.OpenOptions{
-			Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_EXCL,
+			Flags: newFlags | linux.O_CREAT | linux.O_EXCL,
 			// d.mode can be read because d.copyMu is locked.
 			Mode: linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
 		})
 		if err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		defer newFD.DecRef(ctx)
 		if !skipData {
-			// While copying data, free renameMu.
+			// While copying data, free renameMu. Do not lock it again while
+			// d.copyMu is locked, because a rename locks d.copyMu while it
+			// holds renameMu.
 			if mayUnlockRenameMu {
 				d.fs.renameMu.NestedRUnlock(d.fs.renameLockIndex())
 				renameMuUnlocked = true
@@ -235,6 +250,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			Mode:                   linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
 			ForSyntheticMountpoint: forSyntheticMountpoint,
 		}); err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
@@ -285,9 +301,11 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	case linux.S_IFLNK:
 		target, err := vfsObj.ReadlinkAt(ctx, d.fs.creds, &oldpop)
 		if err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		if err := vfsObj.SymlinkAt(ctx, d.fs.creds, &newpop, target); err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
@@ -319,6 +337,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			DevMajor: oldStat.RdevMajor,
 			DevMinor: oldStat.RdevMinor,
 		}); err != nil {
+			cleanupUndoCopyUp()
 			return err
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
@@ -364,10 +383,10 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		return err
 	}
 
-	// Update the dentry's device and inode numbers (except for directories,
-	// for which these remain overlay-assigned).
+	// Get the device and inode numbers of the upper layer file.
+	var upperStat linux.Statx
 	if ftype != linux.S_IFDIR {
-		upperStat, err := vfsObj.StatAt(ctx, d.fs.creds, &vfs.PathOperation{
+		upperStat, err = vfsObj.StatAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  d.upperVD,
 			Start: d.upperVD,
 		}, &vfs.StatOptions{
@@ -381,15 +400,13 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			cleanupUndoCopyUp()
 			return linuxerr.EREMOTE
 		}
-		d.devMajor.Store(upperStat.DevMajor)
-		d.devMinor.Store(upperStat.DevMinor)
-		d.ino.Store(upperStat.Ino)
+	}
 
-		// Lower level dentries for non-directories are no longer accessible from
-		// the overlayfs anymore after copyup. Ask filesystems to release their
-		// resources whenever possible.
-		for _, lowerDentry := range d.lowerVDs {
-			lowerDentry.Dentry().MarkEvictable()
+	// Move the complete upper layer file to its name.
+	if tmpName != "" {
+		if err := d.fs.renameUpper(ctx, parent.upperVD, tmpName, parent.upperVD, name, 0); err != nil {
+			cleanupUndoCopyUp()
+			return err
 		}
 	}
 
@@ -404,23 +421,50 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		allAdded := make(map[memmap.MappableRange]memmap.MappingsOfRange)
 		for seg := d.lowerMappings.FirstSegment(); seg.Ok(); seg = seg.NextSegment() {
 			added := make(memmap.MappingsOfRange)
+			allAdded[seg.Range()] = added
 			for m := range seg.Value() {
 				if err := upperMappable.AddMapping(ctx, m.MappingSpace, m.AddrRange, seg.Start(), m.Writable); err != nil {
-					for m := range added {
-						upperMappable.RemoveMapping(ctx, m.MappingSpace, m.AddrRange, seg.Start(), m.Writable)
-					}
 					for mr, mappings := range allAdded {
 						for m := range mappings {
 							upperMappable.RemoveMapping(ctx, m.MappingSpace, m.AddrRange, mr.Start, m.Writable)
 						}
 					}
+					// Move the upper layer file back to its temporary name,
+					// so that d stays a lower layer file.
+					if tmpName != "" {
+						if err := d.fs.renameUpper(ctx, parent.upperVD, name, parent.upperVD, tmpName, 0); err != nil {
+							panic(fmt.Sprintf("unrecoverable overlayfs inconsistency: failed to undo copy-up after mapping error: %v", err))
+						}
+					}
+					cleanupUndoCopyUp()
 					return err
 				}
 				added[m] = struct{}{}
 			}
-			allAdded[seg.Range()] = added
 		}
+	}
 
+	// The upper layer file stays at name.
+	if tmpName != "" {
+		d.fs.forgetTemp(tmpName)
+	}
+
+	// Update the dentry's device and inode numbers (except for directories,
+	// for which these remain overlay-assigned).
+	if ftype != linux.S_IFDIR {
+		d.devMajor.Store(upperStat.DevMajor)
+		d.devMinor.Store(upperStat.DevMinor)
+		d.ino.Store(upperStat.Ino)
+
+		// Lower level dentries for non-directories are no longer accessible from
+		// the overlayfs anymore after copyup. Ask filesystems to release their
+		// resources whenever possible.
+		for _, lowerDentry := range d.lowerVDs {
+			lowerDentry.Dentry().MarkEvictable()
+		}
+	}
+
+	if mmapOpts != nil && mmapOpts.Mappable != nil {
 		// Switch to the new Mappable. We do this at the end of copy-up
 		// because:
 		//
@@ -438,7 +482,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		dataIdx := d.dataLockIndex()
 		d.dataMu.NestedLock(dataIdx)
 		lowerMappable := d.wrappedMappable
-		d.wrappedMappable = upperMappable
+		d.wrappedMappable = mmapOpts.Mappable
 		d.dataMu.NestedUnlock(dataIdx)
 		// Without data, the upper file is already empty, so the open's
 		// truncation won't invalidate private copies of lower pages.

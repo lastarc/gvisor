@@ -836,8 +836,9 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 
 	// Configure overlay with both layers.
 	overlayOpts.GetFilesystemOptions.InternalData = overlay.FilesystemOptions{
-		UpperRoot:  upperRootVD,
-		LowerRoots: []vfs.VirtualDentry{lowerRootVD},
+		UpperRoot:    upperRootVD,
+		LowerRoots:   []vfs.VirtualDentry{lowerRootVD},
+		PrivateUpper: true,
 	}
 	return &overlayOpts, cu.Release(), nil
 }

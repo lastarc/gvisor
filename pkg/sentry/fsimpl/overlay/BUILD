@@ -146,6 +146,7 @@ go_library(
         "rename_rwmutex.go",
         "req_file_fd_mutex.go",
         "save_restore.go",
+        "upper.go",
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/sentry/checkpoint",
@@ -161,6 +162,7 @@ go_library(
         "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/log",
+        "//pkg/rand",
         "//pkg/refs",
         "//pkg/sentry/arch",
         "//pkg/sentry/fsimpl/lock",

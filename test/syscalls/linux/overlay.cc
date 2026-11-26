@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
@@ -40,6 +41,7 @@
 #include <initializer_list>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -59,6 +61,7 @@
 #include "test/util/socket_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -575,6 +578,112 @@ TEST(OverlayTest, DirectoryRenameInUserNamespace) {
               IsPosixErrorOkAndHolds(0));
 }
 
+// Without userxattr, an overlay inside a user namespace cannot use
+// trusted.overlay.* xattrs, so it cannot make directories opaque. Directory
+// renames then fail with EXDEV, and mkdir at the name of a whiteout fails with
+// EIO. Neither changes the overlay. gVisor uses user.overlay.* xattrs on a
+// gofer upper layer, so there these operations succeed.
+TEST(OverlayTest, DirectoryRenameInUserNamespaceWithoutUserxattr) {
+  // Test fails in gVisor running on <6.0 due to fsgofer getting permission
+  // errors on `mknod`.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  bool in_overlayfs = ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()));
+  KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+  bool use_tmpfs =
+      in_overlayfs ||
+      (GvisorPlatform() == Platform::kNative &&
+       (version.major > 6 || (version.major == 6 && version.minor >= 6)));
+
+  if (!use_tmpfs) {
+    // Some filesystems, such as a host overlayfs under a gofer, do not allow
+    // whiteouts.
+    const std::string probe = JoinPath(base_dir.path(), "probe");
+    if (mknod(probe.c_str(), S_IFCHR, makedev(0, 0)) != 0) {
+      ASSERT_EQ(errno, EPERM);
+      GTEST_SKIP() << "the filesystem does not allow whiteouts";
+    }
+    ASSERT_THAT(unlink(probe.c_str()), SyscallSucceeds());
+  }
+  const bool user_xattrs =
+      !use_tmpfs && IsRunningOnGvisor() &&
+      ASSERT_NO_ERRNO_AND_VALUE(IsGoferfs(base_dir.path()));
+
+  const std::function<void()> parent = [] {};
+  const std::function<void()> child = [&base_dir, use_tmpfs, user_xattrs] {
+    if (use_tmpfs) {
+      TEST_CHECK_SUCCESS(mount(kTmpfs, base_dir.path().c_str(), kTmpfs, 0,
+                               "mode=1777,size=10m"));
+    }
+    auto tmpfs_cleanup = Cleanup([&base_dir, use_tmpfs] {
+      if (use_tmpfs) {
+        TEST_CHECK_SUCCESS(umount2(base_dir.path().c_str(), 0));
+      }
+    });
+
+    auto lower = JoinPath(base_dir.path(), "lower");
+    auto upper = JoinPath(base_dir.path(), "upper");
+    auto work = JoinPath(base_dir.path(), "work");
+    auto merged = JoinPath(base_dir.path(), "merged");
+    for (const std::string* dir : {&lower, &upper, &work, &merged}) {
+      TEST_CHECK_SUCCESS(mkdir(dir->c_str(), 0755));
+    }
+    TEST_CHECK_SUCCESS(mkdir(JoinPath(lower, "lowerdir").c_str(), 0755));
+    TEST_CHECK_SUCCESS(mkdir(JoinPath(lower, "removeddir").c_str(), 0755));
+    int fd = open(JoinPath(lower, "lowerdir/file").c_str(), O_WRONLY | O_CREAT,
+                  0644);
+    TEST_CHECK(fd >= 0);
+    TEST_CHECK_SUCCESS(close(fd));
+
+    std::string opts = absl::StrCat("lowerdir=", lower, ",upperdir=", upper,
+                                    ",workdir=", work);
+    TEST_CHECK_SUCCESS(
+        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
+    auto overlayfs_cleanup =
+        Cleanup([&merged] { TEST_CHECK_SUCCESS(umount2(merged.c_str(), 0)); });
+
+    // Renames of an upper layer directory and of a lower layer directory.
+    TEST_CHECK_SUCCESS(mkdir(JoinPath(merged, "upperdir").c_str(), 0755));
+    for (const auto& [from, to] :
+         {std::pair<std::string, std::string>{"upperdir", "upperdir2"},
+          std::pair<std::string, std::string>{"lowerdir", "lowerdir2"}}) {
+      const std::string old_path = JoinPath(merged, from);
+      const std::string new_path = JoinPath(merged, to);
+      struct stat st;
+      if (user_xattrs) {
+        TEST_CHECK_SUCCESS(rename(old_path.c_str(), new_path.c_str()));
+        TEST_CHECK(stat(old_path.c_str(), &st) == -1 && errno == ENOENT);
+        TEST_CHECK_SUCCESS(stat(new_path.c_str(), &st));
+      } else {
+        TEST_CHECK(rename(old_path.c_str(), new_path.c_str()) == -1 &&
+                   errno == EXDEV);
+        TEST_CHECK(stat(new_path.c_str(), &st) == -1 && errno == ENOENT);
+        TEST_CHECK_SUCCESS(stat(old_path.c_str(), &st));
+      }
+      TEST_CHECK(S_ISDIR(st.st_mode));
+    }
+
+    // mkdir at the name of a whiteout.
+    const std::string removed = JoinPath(merged, "removeddir");
+    TEST_CHECK_SUCCESS(rmdir(removed.c_str()));
+    struct stat st;
+    if (user_xattrs) {
+      TEST_CHECK_SUCCESS(mkdir(removed.c_str(), 0755));
+      TEST_CHECK_SUCCESS(stat(removed.c_str(), &st));
+      TEST_CHECK(S_ISDIR(st.st_mode));
+    } else {
+      TEST_CHECK(mkdir(removed.c_str(), 0755) == -1 && errno == EIO);
+      TEST_CHECK(stat(removed.c_str(), &st) == -1 && errno == ENOENT);
+      TEST_CHECK_SUCCESS(lstat(JoinPath(upper, "removeddir").c_str(), &st));
+      TEST_CHECK(S_ISCHR(st.st_mode) && st.st_rdev == 0);
+    }
+  };
+
+  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
+              IsPosixErrorOkAndHolds(0));
+}
+
 // Tests that overlay can be mounted with a gofer upper layer and confirms basic
 // overlayfs operations.
 TEST(OverlayTest, OnGoferBehavior) {
@@ -654,6 +763,444 @@ TEST(OverlayTest, OnGoferBehavior) {
                 SyscallSucceeds());
     EXPECT_STREQ(xattr_buf, "value");
   }
+}
+
+// Tests renames between hard links in an overlay.
+TEST(OverlayTest, RenameBetweenLinks) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // Creating whiteouts on a gofer fails on hosts running Linux <6.0.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsGoferfs(base_dir.path())) &&
+          ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  // The upper layer cannot be on overlayfs, so use a tmpfs there.
+  Cleanup tmpfs_mount;
+  if (ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()))) {
+    tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(kTmpfs, base_dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  }
+
+  auto lower =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto upper =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto merged =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  ASSERT_NO_ERRNO(
+      CreateWithContents(JoinPath(lower.path(), "file"), "file", 0644));
+  ASSERT_NO_ERRNO(
+      CreateWithContents(JoinPath(lower.path(), "lower_a"), "lower", 0644));
+  ASSERT_THAT(link(JoinPath(lower.path(), "lower_a").c_str(),
+                   JoinPath(lower.path(), "lower_b").c_str()),
+              SyscallSucceeds());
+  // Some filesystems, such as a host overlayfs under a gofer, do not allow
+  // whiteouts.
+  const std::string probe = JoinPath(upper.path(), "probe");
+  if (mknod(probe.c_str(), S_IFCHR, makedev(0, 0)) != 0) {
+    ASSERT_EQ(errno, EPERM);
+    GTEST_SKIP() << "the upper layer does not allow whiteouts";
+  }
+  ASSERT_THAT(unlink(probe.c_str()), SyscallSucceeds());
+
+  // On Linux, links in a lower layer are links in the overlay only with
+  // index=on.
+  std::string opts =
+      absl::StrCat("lowerdir=", lower.path(), ",upperdir=", upper.path(),
+                   ",workdir=", work.path(), ",userxattr",
+                   IsRunningOnGvisor() ? "" : ",index=off");
+  Cleanup overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", merged.path(), "overlay", 0, opts, 0));
+
+  // Linking copies the file up, so both names are links to the same file on
+  // the upper layer. A rename between them does nothing.
+  const std::string file = JoinPath(merged.path(), "file");
+  const std::string link_path = JoinPath(merged.path(), "link");
+  ASSERT_THAT(link(file.c_str(), link_path.c_str()), SyscallSucceeds());
+  int inotify_fd;
+  ASSERT_THAT(inotify_fd = inotify_init1(IN_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor inotify(inotify_fd);
+  ASSERT_THAT(
+      inotify_add_watch(inotify.get(), merged.path().c_str(), IN_ALL_EVENTS),
+      SyscallSucceeds());
+  char event_buf[256];
+  ASSERT_THAT(rename(file.c_str(), link_path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(Links(file), IsPosixErrorOkAndHolds(2));
+  EXPECT_THAT(Links(link_path), IsPosixErrorOkAndHolds(2));
+  EXPECT_THAT(IsWhiteout(JoinPath(upper.path(), "file")),
+              IsPosixErrorOkAndHolds(false));
+
+  // An exchange between them does nothing too.
+  EXPECT_THAT(renameat2(AT_FDCWD, file.c_str(), AT_FDCWD, link_path.c_str(),
+                        RENAME_EXCHANGE),
+              SyscallSucceeds());
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallFailsWithErrno(EAGAIN));
+  EXPECT_THAT(GetContents(file), IsPosixErrorOkAndHolds("file"));
+  EXPECT_THAT(GetContents(link_path), IsPosixErrorOkAndHolds("file"));
+  EXPECT_THAT(IsWhiteout(JoinPath(upper.path(), "file")),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(IsWhiteout(JoinPath(upper.path(), "link")),
+              IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(Links(JoinPath(upper.path(), "file")), IsPosixErrorOkAndHolds(2));
+
+  // Unlinking each name removes one link on the upper layer.
+  ASSERT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Links(file), IsPosixErrorOkAndHolds(1));
+  EXPECT_THAT(Links(JoinPath(upper.path(), "file")), IsPosixErrorOkAndHolds(1));
+  EXPECT_THAT(GetContents(file), IsPosixErrorOkAndHolds("file"));
+
+  // Links to the same file in a lower layer are separate files in the
+  // overlay: the exchange swaps them, and the rename replaces the new name
+  // and leaves a whiteout at the old name.
+  const std::string lower_a = JoinPath(merged.path(), "lower_a");
+  const std::string lower_b = JoinPath(merged.path(), "lower_b");
+  ASSERT_THAT(renameat2(AT_FDCWD, lower_a.c_str(), AT_FDCWD, lower_b.c_str(),
+                        RENAME_EXCHANGE),
+              SyscallSucceeds());
+  EXPECT_THAT(read(inotify.get(), event_buf, sizeof(event_buf)),
+              SyscallSucceeds());
+  EXPECT_THAT(GetContents(lower_a), IsPosixErrorOkAndHolds("lower"));
+  EXPECT_THAT(GetContents(lower_b), IsPosixErrorOkAndHolds("lower"));
+  ASSERT_THAT(rename(lower_a.c_str(), lower_b.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Exists(lower_a), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(GetContents(lower_b), IsPosixErrorOkAndHolds("lower"));
+  EXPECT_THAT(IsWhiteout(JoinPath(upper.path(), "lower_a")),
+              IsPosixErrorOkAndHolds(true));
+
+  // The upper layer has no other files.
+  EXPECT_THAT(ListDir(upper.path(), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(
+                  UnorderedElementsAreArray({"file", "lower_a", "lower_b"})));
+}
+
+// Copy-up of a memory-mapped file keeps the file and its mapping usable.
+TEST(OverlayTest, CopyUpOfMappedFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  // The upper layer cannot be on overlayfs, so use a tmpfs there.
+  Cleanup tmpfs_mount;
+  if (ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()))) {
+    tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(kTmpfs, base_dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  }
+
+  auto lower =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto upper =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  auto merged =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
+  constexpr absl::string_view kContents = "lower";
+  ASSERT_NO_ERRNO(
+      CreateWithContents(JoinPath(lower.path(), "a"), kContents, 0644));
+  ASSERT_NO_ERRNO(
+      CreateWithContents(JoinPath(lower.path(), "b"), kContents, 0644));
+
+  std::string opts =
+      absl::StrCat("lowerdir=", lower.path(), ",upperdir=", upper.path(),
+                   ",workdir=", work.path(), ",userxattr");
+  Cleanup overlay_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", merged.path(), "overlay", 0, opts, 0));
+
+  const std::string a = JoinPath(merged.path(), "a");
+  const std::string b = JoinPath(merged.path(), "b");
+  const FileDescriptor a_fd = ASSERT_NO_ERRNO_AND_VALUE(Open(a, O_RDONLY));
+  const Mapping a_mapping = ASSERT_NO_ERRNO_AND_VALUE(
+      Mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, a_fd.get(), 0));
+  const FileDescriptor b_fd = ASSERT_NO_ERRNO_AND_VALUE(Open(b, O_RDONLY));
+  const Mapping b_mapping = ASSERT_NO_ERRNO_AND_VALUE(
+      Mmap(nullptr, kPageSize, PROT_READ, MAP_SHARED, b_fd.get(), 0));
+
+  // Linking and opening for writing copy up the mapped files.
+  ASSERT_THAT(link(a.c_str(), JoinPath(merged.path(), "link").c_str()),
+              SyscallSucceeds());
+  ASSERT_NO_ERRNO(Open(b, O_WRONLY));
+  EXPECT_THAT(GetContents(JoinPath(upper.path(), "a")),
+              IsPosixErrorOkAndHolds(kContents));
+  EXPECT_THAT(GetContents(JoinPath(upper.path(), "b")),
+              IsPosixErrorOkAndHolds(kContents));
+  EXPECT_EQ(absl::string_view(static_cast<const char*>(a_mapping.ptr()),
+                              kContents.size()),
+            kContents);
+  EXPECT_EQ(absl::string_view(static_cast<const char*>(b_mapping.ptr()),
+                              kContents.size()),
+            kContents);
+
+  // The upper layer has no other files.
+  EXPECT_THAT(
+      ListDir(upper.path(), /*skipdots=*/true),
+      IsPosixErrorOkAndHolds(UnorderedElementsAreArray({"a", "b", "link"})));
+}
+
+// UpperLayerOverlay mounts an overlay with layers in TEST_TMPDIR, which can be
+// a gofer filesystem, or in a tmpfs if TEST_TMPDIR is an overlay.
+struct UpperLayerOverlay {
+  TempPath base;
+  Cleanup tmpfs_mount;
+  TempPath lower, upper, work, merged;
+  Cleanup overlay_mount;
+  std::string L(absl::string_view r) const { return JoinPath(lower.path(), r); }
+  std::string U(absl::string_view r) const { return JoinPath(upper.path(), r); }
+  std::string M(absl::string_view r) const {
+    return JoinPath(merged.path(), r);
+  }
+};
+
+// Returns an error with errno EPERM if the upper layer does not allow
+// whiteouts.
+PosixError SetUpUpperLayerOverlay(UpperLayerOverlay* o) {
+  ASSIGN_OR_RETURN_ERRNO(o->base, TempPath::CreateDir());
+  ASSIGN_OR_RETURN_ERRNO(bool ovl, IsOverlayfs(o->base.path()));
+  if (ovl) {
+    ASSIGN_OR_RETURN_ERRNO(o->tmpfs_mount, Mount(kTmpfs, o->base.path(), kTmpfs,
+                                                 0, "", MNT_DETACH));
+  }
+  ASSIGN_OR_RETURN_ERRNO(o->lower, TempPath::CreateDirIn(o->base.path()));
+  ASSIGN_OR_RETURN_ERRNO(o->upper, TempPath::CreateDirIn(o->base.path()));
+  ASSIGN_OR_RETURN_ERRNO(o->work, TempPath::CreateDirIn(o->base.path()));
+  ASSIGN_OR_RETURN_ERRNO(o->merged, TempPath::CreateDirIn(o->base.path()));
+  const std::string probe = o->U("probe");
+  if (mknod(probe.c_str(), S_IFCHR, makedev(0, 0)) != 0) {
+    return PosixError(errno, "mknod whiteout");
+  }
+  RETURN_ERROR_IF_SYSCALL_FAIL(unlink(probe.c_str()));
+  return NoError();
+}
+
+PosixError MountUpperLayerOverlay(UpperLayerOverlay* o) {
+  std::string opts =
+      absl::StrCat("lowerdir=", o->lower.path(), ",upperdir=", o->upper.path(),
+                   ",workdir=", o->work.path(), ",userxattr",
+                   IsRunningOnGvisor() ? "" : ",index=off");
+  ASSIGN_OR_RETURN_ERRNO(
+      o->overlay_mount,
+      Mount("overlay", o->merged.path(), "overlay", 0, opts, MNT_DETACH));
+  return NoError();
+}
+
+#define SETUP_UPPER_LAYER_OVERLAY(o)                                  \
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN))); \
+  {                                                                   \
+    PosixError err = SetUpUpperLayerOverlay(&o);                      \
+    if (err.errno_value() == EPERM) {                                 \
+      GTEST_SKIP() << "the upper layer does not allow whiteouts";     \
+    }                                                                 \
+    ASSERT_NO_ERRNO(err);                                             \
+  }
+
+bool IsOpaque(const std::string& path) {
+  char buf[8];
+  ssize_t n = getxattr(path.c_str(), "user.overlay.opaque", buf, sizeof(buf));
+  return n == 1 && buf[0] == 'y';
+}
+
+// After operations that replace files with whiteouts and whiteouts with
+// files, the upper layer has exactly the expected files, and no other files.
+TEST(OverlayUpperLayerTest, NoOtherFilesAfterOperations) {
+  // Creating whiteouts on a gofer fails on hosts running Linux <6.0.
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  UpperLayerOverlay o;
+  SETUP_UPPER_LAYER_OVERLAY(o);
+  for (const char* f : {"f1", "f2", "f3", "f4", "f5", "g", "h"}) {
+    ASSERT_NO_ERRNO(CreateWithContents(o.L(f), "lower", 0644));
+  }
+  for (const char* d : {"d1", "d2"}) {
+    ASSERT_THAT(mkdir(o.L(d).c_str(), 0755), SyscallSucceeds());
+    ASSERT_NO_ERRNO(CreateWithContents(o.L(JoinPath(d, "x")), "x", 0644));
+  }
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+
+  // A file at the name of a whiteout, for each kind of file.
+  for (const char* f : {"f1", "f2", "f3", "f4", "f5"}) {
+    ASSERT_THAT(unlink(o.M(f).c_str()), SyscallSucceeds());
+    EXPECT_THAT(IsWhiteout(o.U(f)), IsPosixErrorOkAndHolds(true)) << f;
+  }
+  ASSERT_NO_ERRNO(CreateWithContents(o.M("f1"), "new", 0644));
+  ASSERT_THAT(mkdir(o.M("f2").c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(symlink("target", o.M("f3").c_str()), SyscallSucceeds());
+  ASSERT_THAT(mkfifo(o.M("f4").c_str(), 0644), SyscallSucceeds());
+  ASSERT_THAT(link(o.M("f1").c_str(), o.M("f5").c_str()), SyscallSucceeds());
+  EXPECT_THAT(GetContents(o.M("f1")), IsPosixErrorOkAndHolds("new"));
+  EXPECT_THAT(GetContents(o.M("f5")), IsPosixErrorOkAndHolds("new"));
+  EXPECT_THAT(ListDir(o.M("f2"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(::testing::IsEmpty()));
+  EXPECT_TRUE(IsOpaque(o.U("f2")));
+
+  // rmdir of a directory with a whiteout, then mkdir at its name.
+  ASSERT_THAT(unlink(o.M("d1/x").c_str()), SyscallSucceeds());
+  ASSERT_THAT(rmdir(o.M("d1").c_str()), SyscallSucceeds());
+  EXPECT_THAT(IsWhiteout(o.U("d1")), IsPosixErrorOkAndHolds(true));
+  ASSERT_THAT(mkdir(o.M("d1").c_str(), 0755), SyscallSucceeds());
+  EXPECT_THAT(ListDir(o.M("d1"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(::testing::IsEmpty()));
+  EXPECT_THAT(ListDir(o.U("d1"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(::testing::IsEmpty()));
+  EXPECT_TRUE(IsOpaque(o.U("d1")));
+
+  // A rename of a directory over a directory that contains only a whiteout.
+  ASSERT_THAT(unlink(o.M("d2/x").c_str()), SyscallSucceeds());
+  ASSERT_THAT(mkdir(o.M("nd").c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_ERRNO(CreateWithContents(o.M("nd/y"), "y", 0644));
+  ASSERT_THAT(rename(o.M("nd").c_str(), o.M("d2").c_str()), SyscallSucceeds());
+  EXPECT_THAT(ListDir(o.M("d2"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(UnorderedElementsAreArray({"y"})));
+  EXPECT_THAT(ListDir(o.U("d2"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(UnorderedElementsAreArray({"y"})));
+
+  // A rename of a lower layer file over a lower layer file leaves a whiteout.
+  ASSERT_THAT(rename(o.M("g").c_str(), o.M("h").c_str()), SyscallSucceeds());
+  EXPECT_THAT(IsWhiteout(o.U("g")), IsPosixErrorOkAndHolds(true));
+  // A rename of an upper layer file over an upper layer file whose name is
+  // on the lower layer leaves a whiteout.
+  ASSERT_THAT(rename(o.M("f1").c_str(), o.M("h").c_str()), SyscallSucceeds());
+  EXPECT_THAT(IsWhiteout(o.U("f1")), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(GetContents(o.M("h")), IsPosixErrorOkAndHolds("new"));
+
+  EXPECT_THAT(ListDir(o.U(""), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(UnorderedElementsAreArray(
+                  {"f1", "f2", "f3", "f4", "f5", "d1", "d2", "g", "h"})));
+  EXPECT_THAT(ListDir(o.M(""), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(UnorderedElementsAreArray(
+                  {"f2", "f3", "f4", "f5", "d1", "d2", "h"})));
+}
+
+// Polls the upper layer until stop, and counts the polls that see a state
+// that Linux never shows.
+template <typename F>
+int PollUpper(std::atomic<bool>* stop, F bad) {
+  int n = 0;
+  while (!stop->load()) {
+    if (bad()) n++;
+  }
+  return n;
+}
+
+// An unlink in the overlay replaces the upper layer file with a whiteout, and
+// a file created at the name of a whiteout replaces the whiteout, in one step:
+// the name always exists on the upper layer.
+TEST(OverlayUpperLayerTest, WhiteoutReplacementIsAtomic) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  UpperLayerOverlay o;
+  SETUP_UPPER_LAYER_OVERLAY(o);
+  ASSERT_NO_ERRNO(CreateWithContents(o.L("f"), "lower", 0644));
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+  ASSERT_NO_ERRNO(SetContents(o.M("f"), "upper"));  // Copy up.
+
+  std::atomic<bool> stop(false);
+  int missing = 0;
+  const std::string upper_f = o.U("f");
+  ScopedThread poller([&] {
+    missing = PollUpper(&stop, [&] {
+      struct stat st;
+      return lstat(upper_f.c_str(), &st) != 0 && errno == ENOENT;
+    });
+  });
+  for (int i = 0; i < 2000; i++) {
+    ASSERT_THAT(unlink(o.M("f").c_str()), SyscallSucceeds());
+    ASSERT_NO_ERRNO(CreateWithContents(o.M("f"), "", 0644));
+  }
+  stop.store(true);
+  poller.Join();
+  EXPECT_EQ(missing, 0);
+}
+
+// Copy-up makes the upper layer file at its name in one step: the upper layer
+// never has a part of the file.
+TEST(OverlayUpperLayerTest, CopyUpIsAtomic) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  UpperLayerOverlay o;
+  SETUP_UPPER_LAYER_OVERLAY(o);
+  constexpr int kFiles = 4;
+  constexpr off_t kSize = 16 << 20;
+  for (int i = 0; i < kFiles; i++) {
+    ASSERT_NO_ERRNO(CreateWithContents(o.L(absl::StrCat("f", i)),
+                                       std::string(kSize, 'a'), 0644));
+  }
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+
+  std::atomic<bool> stop(false);
+  int partial = 0;
+  ScopedThread poller([&] {
+    partial = PollUpper(&stop, [&] {
+      int bad = 0;
+      for (int i = 0; i < kFiles; i++) {
+        struct stat st;
+        if (stat(o.U(absl::StrCat("f", i)).c_str(), &st) == 0 &&
+            st.st_size != kSize) {
+          bad++;
+        }
+      }
+      return bad != 0;
+    });
+  });
+  for (int i = 0; i < kFiles; i++) {
+    ASSERT_NO_ERRNO(Open(o.M(absl::StrCat("f", i)), O_WRONLY));
+  }
+  stop.store(true);
+  poller.Join();
+  EXPECT_EQ(partial, 0);
+}
+
+// A rename of a file whose name is on a lower layer leaves a whiteout at the
+// old name in the same step: when the new name exists on the upper layer, the
+// old name does too.
+TEST(OverlayUpperLayerTest, RenameWhiteoutIsAtomic) {
+  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
+  UpperLayerOverlay o;
+  SETUP_UPPER_LAYER_OVERLAY(o);
+  constexpr int kFiles = 500;
+  for (int i = 0; i < kFiles; i++) {
+    ASSERT_NO_ERRNO(CreateWithContents(o.L(absl::StrCat("a", i)), "", 0644));
+  }
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+
+  std::vector<std::string> a, b;
+  for (int i = 0; i < kFiles; i++) {
+    a.push_back(o.U(absl::StrCat("a", i)));
+    b.push_back(o.U(absl::StrCat("b", i)));
+  }
+  std::atomic<bool> stop(false);
+  std::atomic<int> cur(0);
+  int missing = 0;
+  ScopedThread poller([&] {
+    missing = PollUpper(&stop, [&] {
+      const int i = cur.load();
+      struct stat st;
+      return lstat(b[i].c_str(), &st) == 0 && lstat(a[i].c_str(), &st) != 0;
+    });
+  });
+  for (int i = 0; i < kFiles; i++) {
+    cur.store(i);
+    ASSERT_THAT(rename(o.M(absl::StrCat("a", i)).c_str(),
+                       o.M(absl::StrCat("b", i)).c_str()),
+                SyscallSucceeds());
+  }
+  stop.store(true);
+  poller.Join();
+  EXPECT_EQ(missing, 0);
+}
+
+// Files on the upper layer whose names start like the temporary names of the
+// gVisor overlay are visible, whatever their names.
+TEST(OverlayUpperLayerTest, UpperFilesWithTemporaryNamePrefix) {
+  UpperLayerOverlay o;
+  SETUP_UPPER_LAYER_OVERLAY(o);
+  const std::string name =
+      ".gvisor-overlay-tmp-0123456789abcdef0123456789abcdef";
+  ASSERT_NO_ERRNO(CreateWithContents(o.U(name), "upper", 0644));
+  ASSERT_THAT(mkdir(o.U("dir").c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_ERRNO(CreateWithContents(o.U(JoinPath("dir", name)), "", 0644));
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+  EXPECT_THAT(GetContents(o.M(name)), IsPosixErrorOkAndHolds("upper"));
+  // A directory with such a file is not empty.
+  EXPECT_THAT(rmdir(o.M("dir").c_str()), SyscallFailsWithErrno(ENOTEMPTY));
+  EXPECT_THAT(ListDir(o.M("dir"), /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(UnorderedElementsAreArray({name})));
 }
 
 // Files across layers of a nested overlay have distinct (st_dev, st_ino) pairs.
@@ -983,6 +1530,64 @@ TEST_F(OverlayFileTest, UpperContentIsPreferred) {
   EXPECT_THAT(GetContents(MergedPath("file")), IsPosixErrorOkAndHolds("upper"));
 }
 
+// If the upper layer does not allow whiteouts, operations that need a
+// whiteout fail and do not change the overlay.
+TEST(OverlayUpperLayerTest, WhiteoutFailureLeavesOverlayUnchanged) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  UpperLayerOverlay o;
+  PosixError err = SetUpUpperLayerOverlay(&o);
+  if (err.ok()) {
+    GTEST_SKIP() << "the upper layer allows whiteouts";
+  }
+  ASSERT_EQ(err.errno_value(), EPERM);
+  ASSERT_NO_ERRNO(CreateWithContents(o.L("f"), "lower", 0644));
+  ASSERT_NO_ERRNO(CreateWithContents(o.L("g"), "lower", 0644));
+  ASSERT_THAT(mkdir(o.L("d").c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_ERRNO(MountUpperLayerOverlay(&o));
+  ASSERT_NO_ERRNO(SetContents(o.M("f"), "upper"));  // Copy up.
+
+  EXPECT_THAT(unlink(o.M("f").c_str()), SyscallFails());
+  EXPECT_THAT(GetContents(o.M("f")), IsPosixErrorOkAndHolds("upper"));
+  EXPECT_THAT(unlink(o.M("g").c_str()), SyscallFails());
+  EXPECT_THAT(GetContents(o.M("g")), IsPosixErrorOkAndHolds("lower"));
+  EXPECT_THAT(rename(o.M("g").c_str(), o.M("h").c_str()), SyscallFails());
+  EXPECT_THAT(GetContents(o.M("g")), IsPosixErrorOkAndHolds("lower"));
+  EXPECT_THAT(Exists(o.M("h")), IsPosixErrorOkAndHolds(false));
+  EXPECT_THAT(rmdir(o.M("d").c_str()), SyscallFails());
+  EXPECT_THAT(Exists(o.M("d")), IsPosixErrorOkAndHolds(true));
+  // The upper layer has no files with temporary names.
+  std::vector<std::string> names =
+      ASSERT_NO_ERRNO_AND_VALUE(ListDir(o.U(""), /*skipdots=*/true));
+  for (const std::string& name : names) {
+    EXPECT_THAT(name, ::testing::Not(::testing::StartsWith(".gvisor")));
+  }
+}
+
+// Files with names like the temporary names of the gVisor overlay are like
+// other files.
+TEST_F(OverlayFileTest, NamesWithTemporaryNamePrefix) {
+  const std::string lower_name =
+      ".gvisor-overlay-tmp-00000000000000000000000000000000";
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath(lower_name), "lower"));
+  ASSERT_NO_ERRNO(MountOverlay());
+
+  const std::string path = MergedPath(lower_name);
+  ASSERT_NO_ERRNO(SetContents(path, "upper"));
+  EXPECT_THAT(GetContents(path), IsPosixErrorOkAndHolds("upper"));
+  EXPECT_THAT(ListDir(o_.merged, /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(::testing::Contains(lower_name)));
+  ASSERT_THAT(unlink(path.c_str()), SyscallSucceeds());
+  EXPECT_THAT(Exists(path), IsPosixErrorOkAndHolds(false));
+
+  const std::string new_path = MergedPath(".gvisor-overlay-tmp-new");
+  ASSERT_NO_ERRNO(CreateWithContents(new_path, "new"));
+  EXPECT_THAT(GetContents(new_path), IsPosixErrorOkAndHolds("new"));
+  const std::string renamed_path = MergedPath(".gvisor-overlay-tmp-renamed");
+  ASSERT_THAT(rename(new_path.c_str(), renamed_path.c_str()),
+              SyscallSucceeds());
+  EXPECT_THAT(GetContents(renamed_path), IsPosixErrorOkAndHolds("new"));
+}
+
 // Character device /dev/zero can be memory-mapped through an overlay.
 TEST_F(OverlayFileTest, MmapDevZero) {
   int ret =
@@ -1308,6 +1913,32 @@ TEST_F(OverlayCopyUpTest, MappedMemory) {
               SyscallSucceedsWithValue(kPageSize));
 
   EXPECT_EQ(0, memcmp(map.ptr(), upper_content.c_str(), kPageSize));
+}
+
+// A rename of a file can race with the copy-up of the file.
+TEST_F(OverlayCopyUpTest, RenameRacesWithCopyUp) {
+  constexpr size_t kSize = 64 << 20;
+  ASSERT_NO_ERRNO(
+      CreateWithContents(LowerPath("file"), std::string(kSize, 'a')));
+  ASSERT_NO_ERRNO(MountOverlay());
+
+  const std::string path = MergedPath("file");
+  const std::string new_path = MergedPath("file2");
+  ScopedThread writer([&] {
+    // The open copies the file up, unless the rename is first.
+    int fd = open(path.c_str(), O_WRONLY);
+    if (fd >= 0) {
+      TEST_PCHECK(close(fd) == 0);
+    } else {
+      TEST_PCHECK(errno == ENOENT);
+    }
+  });
+  ASSERT_THAT(rename(path.c_str(), new_path.c_str()), SyscallSucceeds());
+  writer.Join();
+  EXPECT_THAT(Exists(path), IsPosixErrorOkAndHolds(false));
+  struct stat st;
+  ASSERT_THAT(stat(new_path.c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_size, static_cast<off_t>(kSize));
 }
 
 // Truncating a file that was mapped read-only before copy up delivers SIGBUS.
