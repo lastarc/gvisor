@@ -218,8 +218,9 @@ type layerOperationKey struct{}
 // a LayerOperation, VFS does not lock vfs.mountMu:
 //   - PrepareDeleteDentry and PrepareRenameDentry fail with EBUSY for a
 //     Dentry with mounts in any mount namespace.
-//   - InvalidateDentry and Mount.DecRef record their changes to mounts in the
-//     LayerOperation. Finish does them.
+//   - CommitDeleteDentry, CommitRenameReplaceDentry, InvalidateDentry and
+//     Mount.DecRef record their changes to mounts in the LayerOperation.
+//     Finish does them.
 type LayerOperation struct {
 	vfs *VirtualFilesystem
 
@@ -316,15 +317,30 @@ func (vfs *VirtualFilesystem) AbortDeleteDentry(d *Dentry) {
 
 // CommitDeleteDentry must be called after PrepareDeleteDentry if the deletion
 // succeeds. If d is mounted, the method returns a list of Virtual Dentries
-// mounted on d that the caller is responsible for DecRefing.
+// mounted on d that the caller is responsible for DecRefing. If ctx is from
+// WithLayerOperation, the list is empty, and LayerOperation.Finish forgets the
+// mounts.
 // +checklocksrelease:d.mu
 func (vfs *VirtualFilesystem) CommitDeleteDentry(ctx context.Context, d *Dentry) []refs.RefCounter {
 	d.dead = true
 	d.mu.Unlock()
 	if d.isMounted() {
-		return vfs.forgetDeadMountpoint(ctx, d)
+		return vfs.forgetDeadMountpointOf(ctx, d)
 	}
 	return nil
+}
+
+// forgetDeadMountpointOf forgets the mounts on the dead Dentry d, like
+// forgetDeadMountpoint. If ctx is from WithLayerOperation,
+// forgetDeadMountpointOf records d in the LayerOperation instead, and
+// LayerOperation.Finish forgets the mounts.
+func (vfs *VirtualFilesystem) forgetDeadMountpointOf(ctx context.Context, d *Dentry) []refs.RefCounter {
+	if op := layerOperationFromContext(ctx); op != nil {
+		op.vfs = vfs
+		op.deadMountpoints = append(op.deadMountpoints, d)
+		return nil
+	}
+	return vfs.forgetDeadMountpoint(ctx, d)
 }
 
 // InvalidateDentry is called when d ceases to represent the file it formerly
@@ -339,14 +355,7 @@ func (vfs *VirtualFilesystem) InvalidateDentry(ctx context.Context, d *Dentry) [
 	if !d.isMounted() {
 		return nil
 	}
-	if op := layerOperationFromContext(ctx); op != nil {
-		// forgetDeadMountpoint locks vfs.mountMu. d is dead, so no new mounts
-		// connect to d until op.Finish.
-		op.vfs = vfs
-		op.deadMountpoints = append(op.deadMountpoints, d)
-		return nil
-	}
-	return vfs.forgetDeadMountpoint(ctx, d)
+	return vfs.forgetDeadMountpointOf(ctx, d)
 }
 
 // renameEnd updates vfs.renameState to account for a completed in-progress rename.
@@ -502,6 +511,8 @@ func (vfs *VirtualFilesystem) AbortRenameDentry(handle *RenameHandle, from, to *
 // is renamed without RENAME_EXCHANGE. If to is not nil, it represents the file
 // that was replaced by from. If to is mounted, the method returns a list of
 // Virtual Dentries mounted on to that the caller is responsible for DecRefing.
+// If ctx is from WithLayerOperation, the list is empty, and
+// LayerOperation.Finish forgets the mounts.
 //
 // Preconditions: PrepareRenameDentry was previously called on from and to.
 // +checklocksrelease:from.mu
@@ -515,7 +526,7 @@ func (vfs *VirtualFilesystem) CommitRenameReplaceDentry(ctx context.Context, han
 		to.dead = true
 		to.mu.Unlock()
 		if to.isMounted() {
-			return vfs.forgetDeadMountpoint(ctx, to)
+			return vfs.forgetDeadMountpointOf(ctx, to)
 		}
 	}
 	return nil

@@ -1238,13 +1238,44 @@ func (vfs *VirtualFilesystem) umount(mnt *Mount) {
 //
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) changeMountpoint(mnt *Mount, mp VirtualDentry) {
-	mp.dentry.mu.Lock()
+	locked := pinMountpoint(mp.dentry)
 	vfs.delayDecRef(vfs.disconnectLocked(mnt))
 	vfs.delayDecRef(mnt)
 	mp.IncRef()
 	vfs.connectLocked(mnt, mp, mp.mount.ns)
-	mp.dentry.mu.Unlock()
+	unpinMountpoint(mp.dentry, locked)
 	mp.mount.ns.notify()
+}
+
+// pinMountpoint makes d a mount point until unpinMountpoint, and locks d.mu if
+// no other goroutine holds it. It returns true if it locked d.mu.
+//
+// pinMountpoint does not wait for d.mu, because the holder of d.mu can wait
+// for a lock whose holder waits for vfs.mountMu, for example an overlay that
+// changes its layers. While d is pinned, PrepareDeleteDentry and
+// PrepareRenameDentry of d lock vfs.mountMu. If pinMountpoint does not lock
+// d.mu, a holder of d.mu that found no mounts on d can delete d. Then
+// CommitDeleteDentry removes the mounts on d, or, if it looked for them
+// before pinMountpoint, the mounts stay on the dead d until their parent
+// mount is unmounted.
+//
+// Precondition: vfs.mountMu must be locked.
+//
+// +checklocksignore
+func pinMountpoint(d *Dentry) bool {
+	d.mounts.Add(1)
+	return d.mu.TryLock()
+}
+
+// unpinMountpoint undoes pinMountpoint. locked is the result of
+// pinMountpoint.
+//
+// +checklocksignore
+func unpinMountpoint(d *Dentry, locked bool) {
+	if locked {
+		d.mu.Unlock()
+	}
+	d.mounts.Add(math.MaxUint32) // -1
 }
 
 // migrateChildrenNs recursively migrates mnt's children into newNs.
@@ -1662,13 +1693,12 @@ func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credent
 	}
 	cleanup.Release()
 
-	// Keep the mount point of oldRoot.mount locked while the mounts move, so
-	// that it stays a mount point for holders of its Dentry.mu; see
-	// PrepareDeleteDentry. Lock it before the writer critical section of
-	// vfs.mounts.seq, because a holder of the Dentry.mu can walk paths.
+	// The mount point of oldRoot.mount must stay a mount point while the
+	// mounts move.
 	rootMpDentry := oldRoot.mount.getKey().dentry
+	rootMpLocked := false
 	if rootMpDentry != putOld.dentry {
-		rootMpDentry.mu.Lock()
+		rootMpLocked = pinMountpoint(rootMpDentry)
 	}
 	vfs.mounts.seq.BeginWrite()
 	mp := vfs.disconnectLocked(newRoot.mount)
@@ -1684,7 +1714,7 @@ func (vfs *VirtualFilesystem) PivotRoot(ctx context.Context, creds *auth.Credent
 	vfs.connectLocked(newRoot.mount, rootMp, rootMp.mount.ns)
 	vfs.mounts.seq.EndWrite()
 	if rootMpDentry != putOld.dentry {
-		rootMpDentry.mu.Unlock()
+		unpinMountpoint(rootMpDentry, rootMpLocked)
 	}
 	putOld.dentry.mu.Unlock()
 

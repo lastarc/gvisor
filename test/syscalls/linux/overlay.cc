@@ -1038,6 +1038,83 @@ TEST(OverlayTest, RemovalOfFileWithMountedUpperRacesWithMount) {
   EXPECT_THAT(GetContents(target), IsPosixErrorOkAndHolds("upper"));
 }
 
+// Tests that a bind mount of an overlay directory that propagates to a slave
+// mount over an existing mount does not deadlock with overlay renames of the
+// directory and with renames of a mount point on the upper layer.
+TEST(OverlayTest, PropagatedMountRacesWithLayerOperations) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  OverlayOnTmpfs o = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
+  SKIP_IF(!SupportsOverlayUpperXattrs(o.upper));
+  ASSERT_THAT(mkdir(o.UpperPath("busy").c_str(), 0755), SyscallSucceeds());
+  ASSERT_NO_ERRNO(o.MountOverlay());
+  ASSERT_THAT(mkdir(o.MergedPath("x").c_str(), 0755), SyscallSucceeds());
+  ASSERT_THAT(mkdir(o.MergedPath("y").c_str(), 0755), SyscallSucceeds());
+  auto src = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Cleanup busy_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(src.path(), o.UpperPath("busy"), "", MS_BIND, "", MNT_DETACH));
+
+  // master is a shared mount, and slave is a slave of it with a mount at
+  // "point". A bind mount at master's "point" propagates to slave and goes
+  // over the mount there.
+  auto master_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto slave_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  Cleanup master_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(kTmpfs, master_dir.path(), kTmpfs, 0, "", MNT_DETACH));
+  ASSERT_THAT(mkdir(JoinPath(master_dir.path(), "point").c_str(), 0755),
+              SyscallSucceeds());
+  ASSERT_THAT(
+      mount(nullptr, master_dir.path().c_str(), nullptr, MS_SHARED, nullptr),
+      SyscallSucceeds());
+  Cleanup slave_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(master_dir.path(), slave_dir.path(), "", MS_BIND, "", MNT_DETACH));
+  ASSERT_THAT(
+      mount(nullptr, slave_dir.path().c_str(), nullptr, MS_SLAVE, nullptr),
+      SyscallSucceeds());
+  Cleanup slave_point_mount = ASSERT_NO_ERRNO_AND_VALUE(Mount(
+      kTmpfs, JoinPath(slave_dir.path(), "point"), kTmpfs, 0, "", MNT_DETACH));
+  const std::string marker = JoinPath(slave_dir.path(), "point", "marker");
+  ASSERT_NO_ERRNO(CreateWithContents(marker, "", 0644));
+
+  const std::string x = o.MergedPath("x");
+  const std::string y = o.MergedPath("y");
+  const std::string point = JoinPath(master_dir.path(), "point");
+  const std::string busy = o.UpperPath("busy");
+  const std::string busy2 = o.UpperPath("busy2");
+  std::atomic<bool> stop(false);
+  ScopedThread mounter([&] {
+    while (!stop.load()) {
+      if (mount(x.c_str(), point.c_str(), nullptr, MS_BIND, nullptr) == 0) {
+        TEST_PCHECK(umount2(point.c_str(), MNT_DETACH) == 0);
+      }
+    }
+  });
+  const auto rename_upper = [&] {
+    while (!stop.load()) {
+      rmdir(busy.c_str());
+      rename(busy.c_str(), busy2.c_str());
+    }
+  };
+  ScopedThread upper_renamer1(rename_upper);
+  ScopedThread upper_renamer2(rename_upper);
+  const auto exchange = [&] {
+    while (!stop.load()) {
+      renameat2(AT_FDCWD, x.c_str(), AT_FDCWD, y.c_str(), RENAME_EXCHANGE);
+    }
+  };
+  ScopedThread exchanger(exchange);
+  absl::SleepFor(absl::Seconds(5));
+  stop.store(true);
+  mounter.Join();
+  upper_renamer1.Join();
+  upper_renamer2.Join();
+  exchanger.Join();
+  EXPECT_THAT(Exists(x), IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(Exists(y), IsPosixErrorOkAndHolds(true));
+  // The mount of slave at "point" is on top again.
+  EXPECT_THAT(Exists(marker), IsPosixErrorOkAndHolds(true));
+}
+
 // UpperLayerOverlay mounts an overlay with layers in TEST_TMPDIR, which can be
 // a gofer filesystem, or in a tmpfs if TEST_TMPDIR is an overlay.
 struct UpperLayerOverlay {
