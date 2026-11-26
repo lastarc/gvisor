@@ -5039,3 +5039,91 @@ func TestForwardingCoalescedTCPEthernet(t *testing.T) {
 		p.DecRef()
 	}
 }
+
+// TestReassembledPacketChecksumWithRXChecksumOffload tests that the transport
+// checksum of a reassembled datagram is verified, even if the link endpoint
+// has RX checksum offload.
+func TestReassembledPacketChecksumWithRXChecksumOffload(t *testing.T) {
+	const (
+		nicID      = 1
+		payloadLen = 256
+		firstLen   = 128
+		port       = 80
+	)
+	udpLength := header.UDPMinimumSize + payloadLen
+	hdr := prependable.New(udpLength)
+	u := header.UDP(hdr.Prepend(udpLength))
+	u.Encode(&header.UDPFields{SrcPort: 5555, DstPort: port, Length: uint16(udpLength)})
+	for i := range u.Payload() {
+		u.Payload()[i] = uint8(i)
+	}
+	sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, addr1, addr2, uint16(udpLength))
+	sum = checksum.Checksum(u.Payload(), sum)
+	u.SetChecksum(^u.CalculateChecksum(sum))
+	// Corrupt the payload after the checksum is calculated.
+	u.Payload()[payloadLen-1] ^= 0xff
+	datagram := hdr.View()
+
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+	})
+	defer s.Destroy()
+	e := channel.New(0, header.IPv6MinimumMTU, linkAddr1)
+	defer e.Close()
+	e.LinkEPCapabilities |= stack.CapabilityRXChecksumOffload
+	if err := s.CreateNIC(nicID, e); err != nil {
+		t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
+	}
+	protocolAddr := tcpip.ProtocolAddress{Protocol: ProtocolNumber, AddressWithPrefix: addr2.WithPrefix()}
+	if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("s.AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
+	}
+	var wq waiter.Queue
+	ep, err := s.NewEndpoint(udp.ProtocolNumber, ProtocolNumber, &wq)
+	if err != nil {
+		t.Fatalf("s.NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, ProtocolNumber, err)
+	}
+	defer ep.Close()
+	if err := ep.Bind(tcpip.FullAddress{Addr: addr2, Port: port}); err != nil {
+		t.Fatalf("ep.Bind(_): %s", err)
+	}
+
+	for _, frag := range []struct {
+		offset uint16
+		more   bool
+		data   []byte
+	}{
+		{offset: 0, more: true, data: datagram[:firstLen]},
+		{offset: firstLen, more: false, data: datagram[firstLen:]},
+	} {
+		hdr := prependable.New(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize)
+		ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize + header.IPv6FragmentHeaderSize))
+		ip.Encode(&header.IPv6Fields{
+			PayloadLength:     uint16(header.IPv6FragmentHeaderSize + len(frag.data)),
+			TransportProtocol: udp.ProtocolNumber,
+			HopLimit:          64,
+			SrcAddr:           addr1,
+			DstAddr:           addr2,
+			ExtensionHeaders: header.IPv6ExtHdrSerializer{
+				&header.IPv6SerializableFragmentExtHdr{
+					FragmentOffset: frag.offset / header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit,
+					M:              frag.more,
+					Identification: 7,
+				},
+			},
+		})
+		buf := buffer.MakeWithData(hdr.View())
+		buf.Append(buffer.NewViewWithData(frag.data))
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
+		e.InjectInbound(ProtocolNumber, pkt)
+		pkt.DecRef()
+	}
+
+	if got := s.Stats().UDP.ChecksumErrors.Value(); got != 1 {
+		t.Errorf("got UDP.ChecksumErrors = %d, want = 1", got)
+	}
+	if got := s.Stats().UDP.PacketsReceived.Value(); got != 0 {
+		t.Errorf("got UDP.PacketsReceived = %d, want = 0", got)
+	}
+}

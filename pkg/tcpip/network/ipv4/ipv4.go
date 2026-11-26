@@ -719,6 +719,7 @@ func (e *endpoint) writePacketPostRouting(r *stack.Route, pkt *stack.PacketBuffe
 			// is set but the packet must be fragmented for the non-forwarding case.
 			return &tcpip.ErrMessageTooLong{}
 		}
+		ip.PrepareTransportChecksumForFragmentation(r, pkt)
 		sent, remain, err := e.handleFragments(r, networkMTU, pkt, func(fragPkt *stack.PacketBuffer) tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
@@ -863,7 +864,9 @@ func (e *endpoint) forwardPacketWithRoute(route *stack.Route, pkt *stack.PacketB
 	newHdr.SetChecksum(0)
 	newHdr.SetChecksum(^newHdr.CalculateChecksum())
 
-	if route.RequiresTXTransportChecksum() {
+	// A fragment has only a part of the datagram, so its transport checksum
+	// stays as it is.
+	if route.RequiresTXTransportChecksum() && !ip.IsIPv4Fragment(newPkt) {
 		newPkt.CalculateTransportChecksum()
 	}
 
@@ -1460,6 +1463,9 @@ func (e *endpoint) deliverPacketLocally(h header.IPv4, pkt *stack.PacketBuffer, 
 		defer resPkt.DecRef()
 		pkt = resPkt
 		h = header.IPv4(pkt.NetworkHeader().Slice())
+		// Checksum offload validates at most the individual fragments, not
+		// the transport payload of the reassembled datagram.
+		pkt.RXChecksumValidated = false
 
 		// The reassembler doesn't take care of fixing up the header, so we need
 		// to do it here.

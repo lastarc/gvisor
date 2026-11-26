@@ -3409,6 +3409,100 @@ func TestReceiveFragments(t *testing.T) {
 	}
 }
 
+// TestReassembledPacketChecksumWithRXChecksumOffload tests that the transport
+// checksum of a reassembled datagram is verified, even if the link endpoint
+// validates the checksums of the packets it receives.
+func TestReassembledPacketChecksumWithRXChecksumOffload(t *testing.T) {
+	const nicID = 1
+	var (
+		srcAddr = tcpip.AddrFromSlice([]byte("\x0c\xa8\x00\x01"))
+		dstAddr = tcpip.AddrFromSlice([]byte("\x0c\xa8\x00\x02"))
+	)
+
+	// Build a UDP datagram with a valid checksum, then corrupt its payload.
+	const payloadLen = 256
+	udpLength := header.UDPMinimumSize + payloadLen
+	hdr := prependable.New(udpLength)
+	u := header.UDP(hdr.Prepend(udpLength))
+	u.Encode(&header.UDPFields{
+		SrcPort: 5555,
+		DstPort: 80,
+		Length:  uint16(udpLength),
+	})
+	for i := range u.Payload() {
+		u.Payload()[i] = uint8(i)
+	}
+	sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, srcAddr, dstAddr, uint16(udpLength))
+	sum = checksum.Checksum(u.Payload(), sum)
+	u.SetChecksum(^u.CalculateChecksum(sum))
+	u.Payload()[payloadLen-1] ^= 0xff
+	datagram := hdr.View()
+
+	ctx := newTestContext()
+	defer ctx.cleanup()
+	s := ctx.s
+	e := channel.New(0, 1280, "\xf0\x00")
+	defer e.Close()
+	e.LinkEPCapabilities |= stack.CapabilityRXChecksumOffload
+	if err := s.CreateNIC(nicID, e); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
+	}
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          header.IPv4ProtocolNumber,
+		AddressWithPrefix: dstAddr.WithPrefix(),
+	}
+	if err := s.AddProtocolAddress(nicID, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
+	}
+	var wq waiter.Queue
+	ep, err := s.NewEndpoint(udp.ProtocolNumber, header.IPv4ProtocolNumber, &wq)
+	if err != nil {
+		t.Fatalf("NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, header.IPv4ProtocolNumber, err)
+	}
+	defer ep.Close()
+	bindAddr := tcpip.FullAddress{Addr: dstAddr, Port: 80}
+	if err := ep.Bind(bindAddr); err != nil {
+		t.Fatalf("Bind(%+v): %s", bindAddr, err)
+	}
+
+	// Send the datagram in two fragments.
+	const firstLen = 128
+	for _, frag := range []struct {
+		flags  uint8
+		offset uint16
+		data   []byte
+	}{
+		{flags: header.IPv4FlagMoreFragments, offset: 0, data: datagram[:firstLen]},
+		{flags: 0, offset: firstLen, data: datagram[firstLen:]},
+	} {
+		ipHdr := prependable.New(header.IPv4MinimumSize)
+		ip := header.IPv4(ipHdr.Prepend(header.IPv4MinimumSize))
+		ip.Encode(&header.IPv4Fields{
+			TotalLength:    header.IPv4MinimumSize + uint16(len(frag.data)),
+			ID:             1,
+			Flags:          frag.flags,
+			FragmentOffset: frag.offset,
+			TTL:            64,
+			Protocol:       uint8(header.UDPProtocolNumber),
+			SrcAddr:        srcAddr,
+			DstAddr:        dstAddr,
+		})
+		ip.SetChecksum(^ip.CalculateChecksum())
+		buf := buffer.MakeWithData(ipHdr.View())
+		buf.Append(buffer.NewViewWithData(frag.data))
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
+		e.InjectInbound(header.IPv4ProtocolNumber, pkt)
+		pkt.DecRef()
+	}
+
+	if got := s.Stats().UDP.ChecksumErrors.Value(); got != 1 {
+		t.Errorf("got UDP ChecksumErrors = %d, want = 1", got)
+	}
+	if got := s.Stats().UDP.PacketsReceived.Value(); got != 0 {
+		t.Errorf("got UDP PacketsReceived = %d, want = 0", got)
+	}
+}
+
 func TestWriteStats(t *testing.T) {
 	const nPackets = 3
 

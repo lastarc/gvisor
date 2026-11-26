@@ -4372,3 +4372,100 @@ func TestOutputDNATReroutesByDestination(t *testing.T) {
 		})
 	}
 }
+
+// TestOutputDNATFragmentChecksum tests that a local UDP datagram that OUTPUT
+// DNAT routes to a link with TX checksum offload, and that the stack sends in
+// fragments, has a valid checksum.
+func TestOutputDNATFragmentChecksum(t *testing.T) {
+	const port = 8080
+	tests := []struct {
+		name      string
+		netProto  tcpip.NetworkProtocolNumber
+		emptyNet  tcpip.Subnet
+		srcAddr   tcpip.Address
+		dstAddr   tcpip.Address
+		natAddr   tcpip.Address
+		mtu       uint32
+		netHdrLen int
+	}{
+		{
+			name:      "IPv4",
+			netProto:  ipv4.ProtocolNumber,
+			emptyNet:  header.IPv4EmptySubnet,
+			srcAddr:   utils.RouterNIC1IPv4Addr.AddressWithPrefix.Address,
+			dstAddr:   testutil.MustParse4("203.0.113.10"),
+			natAddr:   utils.Host2IPv4Addr.AddressWithPrefix.Address,
+			mtu:       600,
+			netHdrLen: header.IPv4MinimumSize,
+		},
+		{
+			name:      "IPv6",
+			netProto:  ipv6.ProtocolNumber,
+			emptyNet:  header.IPv6EmptySubnet,
+			srcAddr:   utils.RouterNIC1IPv6Addr.AddressWithPrefix.Address,
+			dstAddr:   testutil.MustParse6("2001:db8::10"),
+			natAddr:   utils.Host2IPv6Addr.AddressWithPrefix.Address,
+			mtu:       header.IPv6MinimumMTU,
+			netHdrLen: header.IPv6MinimumSize + header.IPv6FragmentHeaderSize,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+			})
+			defer s.Destroy()
+			ep1 := channel.New(10, 1500, "")
+			defer ep1.Close()
+			ep2 := channel.New(10, test.mtu, "")
+			defer ep2.Close()
+			ep1.LinkEPCapabilities = stack.CapabilityTXChecksumOffload
+			ep2.LinkEPCapabilities = stack.CapabilityTXChecksumOffload
+			utils.SetupRouterStack(t, s, ep1, ep2)
+			s.AddRoute(tcpip.Route{Destination: test.emptyNet, NIC: utils.RouterNICID1})
+			setupNAT(t, s, test.netProto, stack.Output, stack.IPHeaderFilter{Protocol: udp.ProtocolNumber, CheckProtocol: true},
+				&stack.DNATTarget{NetworkProtocol: test.netProto, Addr: test.natAddr, Port: port, ChangeAddress: true, ChangePort: true})
+
+			var wq waiter.Queue
+			ep, err := s.NewEndpoint(udp.ProtocolNumber, test.netProto, &wq)
+			if err != nil {
+				t.Fatalf("s.NewEndpoint(%d, %d, _): %s", udp.ProtocolNumber, test.netProto, err)
+			}
+			defer ep.Close()
+			data := bytes.Repeat([]byte{7}, 3*int(test.mtu))
+			to := tcpip.FullAddress{Addr: test.dstAddr, Port: port}
+			if _, err := ep.Write(bytes.NewReader(data), tcpip.WriteOptions{To: &to}); err != nil {
+				t.Fatalf("ep.Write(_, {To: %+v}): %s", to, err)
+			}
+
+			var datagram []byte
+			fragments := 0
+			for {
+				pkt := ep2.Read()
+				if pkt == nil {
+					break
+				}
+				fragments++
+				payload := stack.PayloadSince(pkt.NetworkHeader())
+				b := payload.AsSlice()
+				if test.netProto == ipv4.ProtocolNumber {
+					h := header.IPv4(b)
+					b = b[h.HeaderLength():h.TotalLength()]
+				} else {
+					b = b[test.netHdrLen:]
+				}
+				datagram = append(datagram, b...)
+				payload.Release()
+				pkt.DecRef()
+			}
+			if fragments < 2 {
+				t.Fatalf("got %d fragments, want at least 2", fragments)
+			}
+			u := header.UDP(datagram)
+			if !u.IsChecksumValid(test.srcAddr, test.natAddr, checksum.Checksum(u.Payload(), 0)) {
+				t.Errorf("got invalid UDP checksum %#x in %d fragments", u.Checksum(), fragments)
+			}
+		})
+	}
+}

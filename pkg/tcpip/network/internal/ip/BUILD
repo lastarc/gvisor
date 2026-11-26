@@ -10,6 +10,7 @@ go_library(
     srcs = [
         "duplicate_address_detection.go",
         "errors.go",
+        "fragmentation.go",
         "generic_multicast_protocol.go",
         "reject_with_reset.go",
         "stats.go",

@@ -1047,6 +1047,7 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer, protocol
 			//   not by routers along a packet's delivery path.
 			return &tcpip.ErrMessageTooLong{}
 		}
+		ip.PrepareTransportChecksumForFragmentation(r, pkt)
 		sent, remain, err := e.handleFragments(r, networkMTU, pkt, protocol, func(fragPkt *stack.PacketBuffer) tcpip.Error {
 			// TODO(gvisor.dev/issue/3884): Evaluate whether we want to send each
 			// fragment one by one using WritePacket() (current strategy) or if we
@@ -2132,6 +2133,9 @@ func (e *endpoint) processFragmentExtHdr(extHdr *header.IPv6FragmentExtHdr, it *
 		*it = header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(proto), resPkt.Data().ToBuffer())
 		(*pkt).DecRef()
 		*pkt = resPkt
+		// Checksum offload validates at most the individual fragments, not
+		// the transport payload of the reassembled datagram.
+		resPkt.RXChecksumValidated = false
 	}
 	return nil
 }

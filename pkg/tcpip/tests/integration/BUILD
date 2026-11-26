@@ -221,3 +221,23 @@ go_test(
         "//pkg/tcpip/transport/tcp",
     ],
 )
+
+go_test(
+    name = "fragmentation_test",
+    size = "small",
+    srcs = ["fragmentation_test.go"],
+    deps = [
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/link/pipe",
+        "//pkg/tcpip/link/veth",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/network/ipv6",
+        "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/udp",
+        "//pkg/waiter",
+    ],
+)
